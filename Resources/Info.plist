@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.local.NotchIsland</string>
+	<key>CFBundleName</key>
+	<string>NotchIsland</string>
+	<key>CFBundleDisplayName</key>
+	<string>Notch Island</string>
+	<key>CFBundleExecutable</key>
+	<string>NotchIsland</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>To control Spotify or Music when you press Connect, and to switch dark mode when you press Dark.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>To show your next event. Nothing leaves your Mac.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>To show your next event. Nothing leaves your Mac.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>To show reminders due today. Nothing leaves your Mac.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>To show reminders due today. Nothing leaves your Mac.</string>
+	<key>NSFocusStatusUsageDescription</key>
+	<string>To show a bubble when Do Not Disturb turns on or off.</string>
+</dict>
+</plist>

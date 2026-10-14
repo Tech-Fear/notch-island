@@ -1,0 +1,31 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Xcode 16 or newer (Swift 6)
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_1[6-9]*.app /Applications/Xcode_2*.app 2>/dev/null | sort -V | tail -1)"
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE"
+          swift --version
+      - name: Build the app (ad-hoc signed)
+        run: ./install.sh build
+      - name: Run tests
+        run: swift test
+      - name: Check the bundle
+        run: |
+          test -x build/NotchIsland.app/Contents/MacOS/NotchIsland
+          test -x build/NotchIsland.app/Contents/MacOS/notch-hook
+          test -f build/NotchIsland.app/Contents/Resources/NowPlaying.dylib
+          codesign --verify --strict build/NotchIsland.app

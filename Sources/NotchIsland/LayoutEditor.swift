@@ -1,0 +1,229 @@
+import AppKit
+import Combine
+import SwiftUI
+
+extension AppSettings {
+    /// Moves a widget to `page`, before `target` (or to the end). Works across pages.
+    func move(_ id: UUID, toPage page: Int, before target: UUID?) {
+        guard id != target, let from = layout.pages.firstIndex(where: { $0.contains { $0.id == id } }),
+              let item = layout.pages[from].first(where: { $0.id == id }) else { return }
+        var l = layout
+        l.pages[from].removeAll { $0.id == id }
+        let at = target.flatMap { t in l.pages[page].firstIndex { $0.id == t } } ?? l.pages[page].count
+        l.pages[page].insert(item, at: at)
+        layout = l
+    }
+}
+
+/// Which widget's options popover is open (no @State without Xcode's macro plugin).
+@MainActor
+final class EditorState: ObservableObject {
+    static let shared = EditorState()
+    @Published var optionsFor: UUID?
+}
+
+/// Layout editor: drag widgets between pages, set widths, add/remove pages, tune island sizes.
+/// While it's open the island stays open, so every change shows up live.
+struct LayoutEditorView: View {
+    @ObservedObject var settings = AppSettings.shared
+    @ObservedObject var model = IslandModel.shared
+    @ObservedObject var editor = EditorState.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            GroupBox("Island") {
+                VStack(spacing: 6) {
+                    slider("Width", $settings.layout.islandWidth, 520...1000)
+                    slider("Widget height", $settings.layout.tileHeight, 100...220)
+                    slider("Corner radius", $settings.layout.corner, 4...24)
+                    slider("Spacing", $settings.layout.spacing, 4...20)
+                }
+                .padding(6)
+            }
+
+            Text("Drag widgets to reorder them or move them to another page. Click a page title to show it in the island.")
+                .font(.caption).foregroundStyle(.secondary)
+
+            ScrollView {
+                VStack(spacing: 12) {
+                    ForEach(settings.layout.pages.indices, id: \.self) { i in pageRow(i) }
+                }
+            }
+
+            HStack {
+                Button { settings.layout.pages.append([]); model.showPage(settings.layout.pages.count - 1) } label: {
+                    Label("Add Page", systemImage: "plus")
+                }
+                Spacer()
+                Button("Reset to Default") { settings.layout = .standard; model.showPage(0) }
+                // A menu-bar app has no main menu, so ⌘W and Esc need their own button.
+                Button("Done") { NSApp.keyWindow?.close() }
+                    .keyboardShortcut("w", modifiers: .command)
+                Button("") { NSApp.keyWindow?.close() }.keyboardShortcut(.cancelAction).hidden()
+            }
+        }
+        .padding(16)
+        .frame(width: 620, height: 600)
+    }
+
+    private func slider(_ title: String, _ value: Binding<Double>, _ range: ClosedRange<Double>) -> some View {
+        HStack {
+            Text(title).frame(width: 110, alignment: .leading)
+            Slider(value: value, in: range, step: 1)
+            Text("\(Int(value.wrappedValue))").monospacedDigit().frame(width: 40, alignment: .trailing)
+        }
+    }
+
+    private func pageRow(_ i: Int) -> some View {
+        let tiles = settings.layout.pages[i]
+        let units = CGFloat(max(tiles.reduce(0) { $0 + $1.width }, 1))
+        let current = model.page == i
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Button { model.showPage(i) } label: {
+                    Text("Page \(i + 1)").font(.headline).foregroundStyle(current ? Color.accentColor : Color.primary)
+                }
+                .buttonStyle(.plain)
+                if current { Text("showing").font(.caption).foregroundStyle(.secondary) }
+                Spacer()
+                Menu {
+                    ForEach(TileKind.allCases) { k in
+                        Button { settings.layout.pages[i].append(.init(kind: k, width: k == .music ? 2 : 1)) } label: {
+                            Label(k.title, systemImage: k.symbol)
+                        }
+                    }
+                } label: { Label("Add Widget", systemImage: "plus.square") }
+                .fixedSize()
+                Button(role: .destructive) {
+                    settings.layout.pages.remove(at: i)
+                    model.showPage(min(model.page, settings.layout.pages.count - 1))
+                } label: { Image(systemName: "trash") }
+                .buttonStyle(.borderless)
+                .disabled(settings.layout.pages.count == 1)
+                .help("Delete this page")
+            }
+            GeometryReader { g in
+                let spacing: CGFloat = 6
+                let unit = (g.size.width - spacing * CGFloat(max(tiles.count - 1, 0))) / units
+                HStack(spacing: spacing) {
+                    ForEach(tiles) { t in chip(t, page: i).frame(width: unit * CGFloat(t.width)) }
+                }
+            }
+            .frame(height: 64)
+            .padding(6)
+            .background(RoundedRectangle(cornerRadius: 10).strokeBorder(current ? Color.accentColor : Color.secondary.opacity(0.3),
+                                                                        style: StrokeStyle(lineWidth: 1, dash: tiles.isEmpty ? [4] : [])))
+            .overlay { if tiles.isEmpty { Text("Empty page: drop a widget here").font(.caption).foregroundStyle(.secondary) } }
+            .dropDestination(for: String.self) { items, _ in
+                for s in items { if let id = UUID(uuidString: s) { settings.move(id, toPage: i, before: nil) } }
+                return true
+            }
+        }
+    }
+
+    private func chip(_ t: Placement, page: Int) -> some View {
+        VStack(spacing: 4) {
+            Label(t.kind.title, systemImage: t.kind.symbol)
+                .font(.system(size: 11, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.75)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 4) {
+                Spacer(minLength: 0)
+                Button { editor.optionsFor = t.id } label: { Image(systemName: "gearshape") }
+                    .buttonStyle(.borderless).help("Options")
+                    .popover(isPresented: Binding(get: { editor.optionsFor == t.id },
+                                                  set: { if !$0 { editor.optionsFor = nil } })) { options(t.kind) }
+                Button { settings.layout.pages[page].removeAll { $0.id == t.id } } label: { Image(systemName: "xmark") }
+                    .buttonStyle(.borderless).help("Remove")
+            }
+            .font(.system(size: 11, weight: .medium))
+            HStack(spacing: 6) {
+                Button { resize(t, page: page, by: -1) } label: { Image(systemName: "minus") }
+                    .disabled(t.width <= IslandLayout.widthRange.lowerBound)
+                Text("width \(t.width)").font(.system(size: 10).monospacedDigit()).foregroundStyle(.secondary)
+                Button { resize(t, page: page, by: 1) } label: { Image(systemName: "plus") }
+                    .disabled(t.width >= IslandLayout.widthRange.upperBound)
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.15)))
+        .draggable(t.id.uuidString)
+        .dropDestination(for: String.self) { items, _ in
+            for s in items { if let id = UUID(uuidString: s) { settings.move(id, toPage: page, before: t.id) } }
+            return true
+        }
+    }
+
+    /// Switches for the parts of one widget type (shared by every copy of that widget).
+    private func options(_ kind: TileKind) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(kind.title, systemImage: kind.symbol).font(.headline)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(kind.parts) { part in
+                        Toggle(part.title, isOn: Binding(get: { settings.shows(kind, part.id) },
+                                                         set: { settings.setPart(kind, part.id, $0) }))
+                    }
+                }
+            }
+            .frame(maxHeight: 320)
+            Text("Parts also hide on their own when the widget is too small.").font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .frame(width: 260)
+    }
+
+    private func resize(_ t: Placement, page: Int, by delta: Int) {
+        guard let j = settings.layout.pages[page].firstIndex(where: { $0.id == t.id }) else { return }
+        let w = settings.layout.pages[page][j].width + delta
+        if IslandLayout.widthRange.contains(w) { settings.layout.pages[page][j].width = w }
+    }
+}
+
+@MainActor
+final class LayoutEditorController: NSObject, NSWindowDelegate {
+    static let shared = LayoutEditorController()
+    private var window: NSWindow?
+
+    func show() {
+        if window == nil {
+            let w = NSWindow(contentViewController: NSHostingController(rootView: LayoutEditorView()))
+            w.title = "Edit Layout"
+            w.styleMask = [.titled, .closable]
+            w.isReleasedWhenClosed = false
+            w.delegate = self
+            w.center()
+            window = w
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        // A menu-bar app may not be allowed to come forward; orderFrontRegardless shows the window anyway.
+        window?.orderFrontRegardless()
+        window?.makeKey()
+        IslandModel.shared.setEditing(window?.isVisible == true)
+        // Never leave the island held open by an editor that isn't on screen.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            if self?.window?.isVisible != true { IslandModel.shared.setEditing(false) }
+        }
+        // The open island sits at the top of the screen: keep the editor below it, also when it grows.
+        sizeWatch = IslandModel.shared.$islandSize
+            .debounce(for: .milliseconds(450), scheduler: RunLoop.main)
+            .sink { [weak self] size in MainActor.assumeIsolated { self?.placeBelowIsland(size) } }
+    }
+
+    private var sizeWatch: AnyCancellable?
+
+    private func placeBelowIsland(_ island: CGSize) {
+        guard let window, let screen = window.screen ?? NSScreen.main else { return }
+        let islandBottom = IslandModel.shared.notch.screenFrame.maxY - island.height - 30 - 10 // 30: the panel's shadow margin
+        let top = min(window.frame.maxY, islandBottom)
+        guard window.frame.maxY > islandBottom || window.frame.minY < screen.visibleFrame.minY else { return }
+        let y = max(screen.visibleFrame.minY, top - window.frame.height)
+        window.setFrameOrigin(NSPoint(x: window.frame.minX, y: y))
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        sizeWatch = nil
+        IslandModel.shared.setEditing(false)
+    }
+}

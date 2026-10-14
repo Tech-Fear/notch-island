@@ -1,0 +1,520 @@
+import AppKit
+import Combine
+import SwiftUI
+
+// MARK: - Notch geometry
+
+struct NotchGeometry: Equatable {
+    var screenFrame: CGRect
+    var width: CGFloat      // width of the hardware notch (or the fake one)
+    var height: CGFloat     // height of the notch / menu bar band
+    var hasNotch: Bool
+
+    static let ear: CGFloat = 6 // outward curve where the island meets the menu bar
+
+    /// Uses the screen with a notch; on Macs without one, draws a fake notch at the top centre of the main screen.
+    static func detect() -> NotchGeometry {
+        for s in NSScreen.screens where s.safeAreaInsets.top > 0 {
+            if let l = s.auxiliaryTopLeftArea, let r = s.auxiliaryTopRightArea {
+                return NotchGeometry(screenFrame: s.frame,
+                                     width: s.frame.width - l.width - r.width,
+                                     height: s.safeAreaInsets.top,
+                                     hasNotch: true)
+            }
+        }
+        let s = NSScreen.main ?? NSScreen.screens[0]
+        let menuBar = s.frame.maxY - s.visibleFrame.maxY
+        return NotchGeometry(screenFrame: s.frame, width: 190,
+                             height: menuBar > 0 ? menuBar : 24, hasNotch: false)
+    }
+}
+
+// MARK: - Island state
+
+enum IslandState { case resting, compact, peek, expanded }
+enum CompactActivity { case claude, timer, music, sensor }
+
+struct Peek: Identifiable {
+    enum Icon { case symbol(String), image(NSImage) }
+    let id = UUID()
+    var icon: Icon
+    var title: String
+    var subtitle: String?
+    var duration: TimeInterval = 3   // 2 to 4 seconds
+}
+
+@MainActor
+final class IslandModel: ObservableObject {
+    static let shared = IslandModel()
+
+    @Published private(set) var state: IslandState = .resting
+    @Published private(set) var activity: CompactActivity?
+    @Published private(set) var peek: Peek?
+    @Published var notch = NotchGeometry.detect()
+    @Published var islandSize: CGSize = .zero
+    /// Carousel page shown when the island is open.
+    @Published var page = 0
+    /// Development preview (snapshot command): these widgets at this height, instead of the carousel.
+    @Published var preview: (tiles: [Placement], height: Double)? { didSet { recompute() } }
+
+    private var hoverExpanded = false
+    private var editing = false   // the layout editor keeps the island open
+    private var dropOpen = false  // files are being dragged over the island
+    /// A file drag is in progress near the top of the screen: the island opens as a big drop zone.
+    @Published private(set) var dragNear = false
+    private var held = false      // a file is being dragged out of the shelf
+    private(set) var pinned = false
+    private var hoverTimer: Timer?
+    private var peekQueue: [(Peek, Date)] = []
+    private var peekTimer: Timer?
+
+    static let spring = Animation.spring(response: 0.38, dampingFraction: 0.8)
+
+    // Hover: opens 0.25 s after the mouse rests on the notch, closes when it leaves.
+    func mouseInside(_ inside: Bool) {
+        if inside {
+            Awake.hold("hover", true)
+            guard !hoverExpanded, hoverTimer == nil else { return } // don't restart a running countdown
+            let t = Timer(timeInterval: 0.25, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.hoverTimer = nil
+                    self?.hoverExpanded = true
+                    self?.recompute()
+                }
+            }
+            t.tolerance = 0
+            RunLoop.main.add(t, forMode: .common)
+            hoverTimer = t
+        } else {
+            cancelHoverTimer()
+            Awake.hold("hover", false)
+            if hoverExpanded {
+                hoverExpanded = false
+                recompute()
+            }
+        }
+    }
+
+    private func cancelHoverTimer() {
+        hoverTimer?.invalidate()
+        hoverTimer = nil
+    }
+
+    // A click keeps it open; a click anywhere else lets it close again.
+    func clickedInside() {
+        cancelHoverTimer()
+        hoverExpanded = true
+        pinned = true
+        recompute()
+    }
+
+    func clickedOutside() {
+        guard pinned else { return }
+        pinned = false
+        hoverExpanded = false
+        recompute()
+    }
+
+    func showPage(_ i: Int) {
+        let count = AppSettings.shared.layout.pages.count
+        guard count > 0 else { return }
+        withAnimation(Self.spring) { page = min(max(i, 0), count - 1) }
+    }
+
+    func setEditing(_ on: Bool) { editing = on; recompute() }
+    func holdOpen(_ on: Bool) {
+        guard held != on else { return }
+        held = on
+        recompute()
+        // SwiftUI's onDrag has no "drag ended" callback, so watch the mouse button instead.
+        if on {
+            Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] t in
+                MainActor.assumeIsolated {
+                    if NSEvent.pressedMouseButtons & 1 == 0 { t.invalidate(); self?.holdOpen(false) }
+                }
+            }
+        }
+    }
+
+    /// Dragging files over the island opens it on the page with the shelf.
+    func setDropTargeted(_ on: Bool) {
+        guard dropOpen != on else { return }
+        dropOpen = on
+        if on, let i = AppSettings.shared.layout.page(of: .shelf) { showPage(i) }
+        recompute()
+    }
+
+    func setDragNear(_ on: Bool) {
+        guard dragNear != on else { return }
+        dragNear = on
+        if on, let i = AppSettings.shared.layout.page(of: .shelf) { showPage(i) }
+        recompute()
+        // Other apps' drags swallow the mouse-up, so watch the button to know when the drag ended.
+        if on {
+            Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] t in
+                MainActor.assumeIsolated {
+                    guard let self, self.dragNear else { t.invalidate(); return }
+                    if NSEvent.pressedMouseButtons & 1 == 0 {
+                        t.invalidate()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { self.setDragNear(false) } // let the drop land first
+                    }
+                }
+            }
+        }
+    }
+
+    func show(_ peek: Peek) {
+        peekQueue.append((peek, Date()))
+        pumpPeeks()
+    }
+
+    private func pumpPeeks() {
+        guard peek == nil, state != .expanded else { return }
+        peekQueue.removeAll { Date().timeIntervalSince($0.1) > 8 } // stale bubbles are dropped
+        guard !peekQueue.isEmpty else { return }
+        let next = peekQueue.removeFirst().0
+        peek = next
+        recompute()
+        peekTimer = Timer.scheduledTimer(withTimeInterval: next.duration, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.peek = nil
+                self?.recompute()
+                self?.pumpPeeks()
+            }
+        }
+    }
+
+    /// Called whenever anything that affects the island changes.
+    func recompute() {
+        let claude = ClaudeBridge.shared
+        if claude.working { activity = .claude }
+        else if FocusTimer.shared.running { activity = .timer }
+        else if MusicController.shared.now?.playing == true { activity = .music }
+        else if SensorWatcher.shared.active { activity = .sensor }
+        else { activity = nil }
+
+        let new: IslandState
+        if hoverExpanded || pinned || editing || preview != nil || dropOpen || dragNear || held || !claude.pending.isEmpty { new = .expanded }
+        else if peek != nil { new = .peek }
+        else if activity != nil { new = .compact }
+        else { new = .resting }
+
+        if new != state {
+            // Bubbles and the open island run short timers; keep them on time (see Awake).
+            if new == .peek || new == .expanded {
+                Awake.hold("island", true)
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in // after the 0.5 s shrink
+                    if let s = self?.state, s != .peek, s != .expanded { Awake.hold("island", false) }
+                }
+            }
+            withAnimation(Self.spring) { state = new }
+            if new != .expanded { pumpPeeks() }
+        }
+    }
+
+    // Island widths per state (heights come from the content).
+    var compactSide: CGFloat { 58 }
+    var restingWidth: CGFloat { notch.width + 2 * NotchGeometry.ear }
+    func width(for s: IslandState) -> CGFloat {
+        switch s {
+        case .resting: restingWidth
+        case .compact: restingWidth + 2 * compactSide
+        case .peek: max(restingWidth + 2 * compactSide, 360)
+        case .expanded: AppSettings.shared.layout.islandWidth
+        }
+    }
+
+    /// The panel is sized to hold the largest island of the current state, plus room for the shadow.
+    func panelSize(for s: IslandState) -> CGSize {
+        let margin: CGFloat = 40
+        switch s {
+        case .resting, .compact: return CGSize(width: width(for: .compact) + margin, height: notch.height + margin)
+        case .peek: return CGSize(width: width(for: .peek) + margin, height: notch.height + 120)
+        case .expanded: return CGSize(width: width(for: .expanded) + margin,
+                                      height: min(notch.screenFrame.height * 0.8, 640))
+        }
+    }
+}
+
+// MARK: - App Nap
+
+/// macOS throttles the timers of an idle background app ("App Nap"), so a 0.25 s hover timer or a
+/// 3 s bubble could fire seconds late. App Nap is turned off only while something timed is on screen.
+@MainActor
+enum Awake {
+    private static var held: [String: NSObjectProtocol] = [:]
+
+    static func hold(_ reason: String, _ on: Bool) {
+        if on, held[reason] == nil {
+            held[reason] = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical], reason: reason)
+        } else if !on, let a = held.removeValue(forKey: reason) {
+            ProcessInfo.processInfo.endActivity(a)
+        }
+    }
+}
+
+// MARK: - Panel
+
+/// Borderless, transparent, non-activating: it never takes focus from the app you're using.
+final class IslandPanel: NSPanel {
+    init() {
+        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false // the soft shadow is drawn by SwiftUI so it follows the island's shape
+        isFloatingPanel = true // must come before `level`: it resets the level to .floating
+        level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3) // above the menu bar
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        hidesOnDeactivate = false
+        isMovable = false
+        isReleasedWhenClosed = false
+        becomesKeyOnlyIfNeeded = true
+    }
+
+    /// macOS skips windows that can't become key when it looks for a drop target, so key status is
+    /// allowed only while a file is being dragged. Even then the panel never needs the keyboard
+    /// (becomesKeyOnlyIfNeeded), so it doesn't take focus from your app.
+    var acceptsDrops = false
+    override var canBecomeKey: Bool { acceptsDrops }
+    override var canBecomeMain: Bool { false }
+
+    /// AppKit normally pushes windows below the menu bar; the island has to sit on top of the notch.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+}
+
+/// Clicks work on the first try, even though the panel is never the key window.
+final class FirstMouseHostingView<V: View>: NSHostingView<V> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    // Let file drags fall through to IslandContainerView, which handles them.
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { superview?.draggingEntered(sender) ?? [] }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { superview?.draggingUpdated(sender) ?? [] }
+    override func draggingExited(_ sender: NSDraggingInfo?) { superview?.draggingExited(sender) }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { true }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { superview?.performDragOperation(sender) ?? false }
+}
+
+/// Owns the tracking area. It covers only the visible island, so hovering the menu bar does nothing.
+final class IslandContainerView: NSView {
+    var onHover: ((Bool) -> Void)?
+    private var area: NSTrackingArea?
+    var islandSize: CGSize = .zero { didSet { if islandSize != oldValue { updateTrackingAreas(); checkMouse() } } }
+
+    /// Extra hover margin around the small resting/compact island: the bare notch is a tiny
+    /// target and real hovers often brush past it in under 0.25 s.
+    var slack: CGFloat = 0 { didSet { if slack != oldValue { updateTrackingAreas(); checkMouse() } } }
+
+    var hoverRect: NSRect {
+        NSRect(x: (bounds.width - islandSize.width) / 2 - slack, y: bounds.height - islandSize.height - slack,
+               width: islandSize.width + 2 * slack, height: islandSize.height + slack + 2) // +2: the very top pixel row counts
+    }
+
+    override func updateTrackingAreas() {
+        if let area { removeTrackingArea(area) }
+        let a = NSTrackingArea(rect: hoverRect, options: [.mouseEnteredAndExited, .activeAlways], owner: self)
+        addTrackingArea(a)
+        area = a
+        super.updateTrackingAreas()
+        DispatchQueue.main.async { [weak self] in self?.checkMouse() }
+    }
+
+    // Enter/exit are only hints: AppKit also sends them when the area is rebuilt (window resize, page
+    // change) while the mouse hasn't moved, so the real position decides.
+    // MARK: File drops (AppKit: SwiftUI's onDrop doesn't receive drags in this panel)
+
+    var onFilesDropped: (([URL]) -> Void)?
+    var onDropHover: ((Bool) -> Void)?
+
+    private func fileURLs(_ info: NSDraggingInfo) -> [URL] {
+        info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard !fileURLs(sender).isEmpty else { return [] }
+        onDropHover?(true)
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { fileURLs(sender).isEmpty ? [] : .copy }
+    override func draggingExited(_ sender: NSDraggingInfo?) { onDropHover?(false) }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = fileURLs(sender)
+        onDropHover?(false)
+        guard !urls.isEmpty else { return false }
+        onFilesDropped?(urls)
+        return true
+    }
+
+    override func mouseEntered(with event: NSEvent) { checkMouse() }
+    override func mouseExited(with event: NSEvent) { checkMouse() }
+
+    /// After the area changes size, AppKit doesn't send enter/exit for a mouse that's already there.
+    func checkMouse() {
+        guard let window else { return }
+        let p = convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        onHover?(hoverRect.contains(p))
+    }
+}
+
+@MainActor
+final class IslandController {
+    private let panel = IslandPanel()
+    private let container = IslandContainerView()
+    private let model = IslandModel.shared
+    private var bag = Set<AnyCancellable>()
+    private var shrinkWork: DispatchWorkItem?
+    private var monitors: [Any] = []
+
+    init() {
+        let host = FirstMouseHostingView(rootView: IslandRootView())
+        host.autoresizingMask = [.width, .height]
+        container.addSubview(host)
+        container.onHover = { [weak self] inside in self?.model.mouseInside(inside) }
+        container.registerForDraggedTypes([.fileURL])
+        container.onDropHover = { [weak self] on in self?.model.setDropTargeted(on) }
+        container.onFilesDropped = { urls in
+            guard AppSettings.shared.layout.contains(.shelf) else { return }
+            Shelf.shared.add(urls)
+            IslandModel.shared.show(Peek(icon: .symbol("tray.and.arrow.down.fill"), title: "Added to Shelf",
+                                         subtitle: urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) files", duration: 2))
+        }
+        panel.contentView = container
+
+        model.$islandSize.sink { [weak self] size in
+            self?.container.islandSize = size
+            self?.fitExpanded(to: size)
+        }.store(in: &bag)
+        model.$dragNear.sink { [weak self] on in self?.panel.acceptsDrops = on }.store(in: &bag)
+        model.$state.sink { [weak self] s in
+            self?.container.slack = (s == .resting || s == .compact) ? 16 : 0
+            self?.resize(for: s)
+        }.store(in: &bag)
+
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
+            .sink { [weak self] _ in
+                for delay in [0.0, 1.0, 3.0] { // and again once the change has settled
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        self?.resize(for: self?.model.state ?? .resting, immediately: true)
+                    }
+                }
+            }.store(in: &bag)
+
+        // Click inside pins the island open; a click anywhere else unpins it.
+        // (Mouse monitors need no permission; only keyboard monitors do.)
+        if let m = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown, handler: { [weak self] e in
+            if e.window === self?.panel, let self {
+                let p = self.container.convert(e.locationInWindow, from: nil)
+                if self.container.hoverRect.contains(p) { self.model.clickedInside() }
+            }
+            return e
+        }) { monitors.append(m) }
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] _ in
+            MainActor.assumeIsolated { self?.model.clickedOutside() }
+        }) { monitors.append(m) }
+
+        // File drags: the drag pasteboard changes when a drag starts. Once a file drag comes near
+        // the notch, open the island as a drop zone, so there's no waiting and no small target.
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp], handler: { [weak self] e in
+            MainActor.assumeIsolated { self?.trackFileDrag(e) }
+        }) { monitors.append(m) }
+
+        // Two-finger horizontal swipe on the open island flips carousel pages.
+        if let m = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel, handler: { [weak self] e in
+            self?.swipe(e)
+            return e
+        }) { monitors.append(m) }
+
+        AppSettings.shared.$layout.dropFirst().sink { [weak self] layout in
+            guard let self else { return }
+            if self.model.page >= layout.pages.count { self.model.showPage(layout.pages.count - 1) }
+            if self.model.state == .expanded { self.resize(for: .expanded, immediately: true) }
+        }.store(in: &bag)
+
+        resize(for: model.state, immediately: true)
+        panel.orderFrontRegardless()
+    }
+
+    private var dragCount = NSPasteboard(name: .drag).changeCount
+
+    private func trackFileDrag(_ e: NSEvent) {
+        switch e.type {
+        case .leftMouseDown:
+            dragCount = NSPasteboard(name: .drag).changeCount
+        case .leftMouseDragged:
+            let pb = NSPasteboard(name: .drag)
+            guard pb.changeCount != dragCount, pb.types?.contains(.fileURL) == true,
+                  AppSettings.shared.layout.contains(.shelf) else { return }
+            let p = NSEvent.mouseLocation, screen = model.notch.screenFrame
+            // Generous zone: top 180 pt of the screen, 760 pt wide around the notch.
+            let near = p.y > screen.maxY - 180 && abs(p.x - screen.midX) < 380
+            if near { model.setDragNear(true) }
+            else if model.dragNear, !panel.frame.contains(p) { model.setDragNear(false) }
+        default: // mouse up: the drop (if any) has been handled by then
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.model.setDragNear(false) }
+        }
+    }
+
+    private var swipeX: CGFloat = 0
+    private var swiped = false
+
+    private func swipe(_ e: NSEvent) {
+        guard e.window === panel, model.state == .expanded, ClaudeBridge.shared.pending.isEmpty else { return }
+        // A trackpad gesture starts with .began; a mouse wheel sends phase-less events, each its own "gesture".
+        if e.phase == .began || (e.phase.isEmpty && e.momentumPhase.isEmpty) { swipeX = 0; swiped = false }
+        guard abs(e.scrollingDeltaX) > abs(e.scrollingDeltaY) else { return }
+        swipeX += e.scrollingDeltaX
+        if !swiped, abs(swipeX) > 40 {
+            swiped = true // one page per gesture
+            model.showPage(model.page + (swipeX < 0 ? 1 : -1))
+        }
+    }
+
+    private func frame(for s: IslandState) -> NSRect {
+        // Screens can be half-updated right after a display change: re-check every time.
+        let notch = NotchGeometry.detect()
+        if notch != model.notch { model.notch = notch }
+        let size = model.panelSize(for: s)
+        let screen = model.notch.screenFrame
+        return NSRect(x: screen.midX - size.width / 2, y: screen.maxY - size.height,
+                      width: size.width, height: size.height)
+    }
+
+    private var fitWork: DispatchWorkItem?
+
+    /// The open island's panel starts at its maximum height so the opening animation is never clipped,
+    /// then shrinks to the island once it settles, so no invisible window area covers other windows.
+    private func fitExpanded(to size: CGSize) {
+        fitWork?.cancel()
+        guard model.state == .expanded, size.height > 0 else { return }
+        let full = frame(for: .expanded)
+        if size.height + 30 > panel.frame.height { panel.setFrame(full, display: true); return } // content grew
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.model.state == .expanded else { return }
+            var f = full
+            f.size.height = min(full.height, self.model.islandSize.height + 30) // room for the shadow
+            f.origin.y = full.maxY - f.height
+            if abs(f.height - self.panel.frame.height) > 1 { self.panel.setFrame(f, display: true) }
+        }
+        fitWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    /// Grow right away; shrink only after the closing animation has finished.
+    private func resize(for s: IslandState, immediately: Bool = false) {
+        shrinkWork?.cancel()
+        fitWork?.cancel()
+        let target = frame(for: s)
+        if immediately || target.height >= panel.frame.height || target.width >= panel.frame.width {
+            panel.setFrame(target, display: true)
+        } else {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.model.state == s else { return }
+                self.panel.setFrame(target, display: true)
+            }
+            shrinkWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+        }
+    }
+}

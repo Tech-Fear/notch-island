@@ -1,0 +1,16 @@
+# Build output
+.build/
+build/
+.swiftpm/
+DerivedData/
+
+# Local tool state (contains machine-specific paths)
+.claude/
+
+# Never commit signing material
+*.p12
+*.pem
+*.cer
+*.key
+
+.DS_Store
