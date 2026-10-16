@@ -118,6 +118,7 @@ struct CompactView: View {
     @ObservedObject var music = MusicController.shared
     @ObservedObject var timer = FocusTimer.shared
     @ObservedObject var sensors = SensorWatcher.shared
+    @ObservedObject var tasks = TaskCenter.shared
     @Environment(\.theme) var theme
 
     var body: some View {
@@ -126,10 +127,8 @@ struct CompactView: View {
             Spacer(minLength: 0)
             right.frame(width: side)
                 .overlay(alignment: .trailing) {
-                    // Like iOS: green = camera, orange = microphone.
-                    if sensors.active, model.activity != .sensor {
-                        Circle().fill(sensors.cameraOn ? Color.green : Color.orange).frame(width: 6, height: 6).padding(.trailing, 4)
-                    }
+                    // Like iOS: green = camera, orange = microphone (both when both are on).
+                    if sensors.active, model.activity != .sensor { sensorDots(size: 6).padding(.trailing, 4) }
                 }
         }
     }
@@ -141,13 +140,18 @@ struct CompactView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(theme.accent)
                 .contentTransition(.symbolEffect(.replace))
+        case .task:
+            Image(systemName: "terminal").font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.accent)
         case .timer:
             Image(systemName: "timer").font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.accent)
         case .music:
             CoverView(image: music.now?.cover, size: 20, corner: 5)
         case .sensor:
-            Image(systemName: sensors.cameraOn ? "video.fill" : "mic.fill").font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(sensors.cameraOn ? Color.green : Color.orange)
+            HStack(spacing: 4) {
+                if sensors.cameraOn { Image(systemName: "video.fill").foregroundStyle(Color.green) }
+                if sensors.micApps != nil { Image(systemName: "mic.fill").foregroundStyle(Color.orange) }
+            }
+            .font(.system(size: 11, weight: .semibold))
         case nil:
             EmptyView()
         }
@@ -155,14 +159,39 @@ struct CompactView: View {
 
     @ViewBuilder private var right: some View {
         switch model.activity {
-        case .claude: WorkingGrid(color: theme.accent)
+        case .claude:
+            HStack(spacing: 4) { WorkingGrid(color: theme.accent); runningBadge }
+        case .task:
+            if let p = tasks.items.last?.progress {
+                Text("\(Int(p * 100))%").font(.system(size: 12, weight: .semibold).monospacedDigit()).foregroundStyle(Theme.bandText)
+            } else {
+                HStack(spacing: 4) { WorkingGrid(color: theme.accent); runningBadge }
+            }
         case .timer:
             Text(timer.remainingText).font(.system(size: 12, weight: .semibold).monospacedDigit())
                 .foregroundStyle(Theme.bandText)
         case .music: EqualizerBars(color: theme.accent)
         case .sensor:
-            Circle().fill(sensors.cameraOn ? Color.green : Color.orange).frame(width: 7, height: 7)
+            sensorDots(size: 7)
         case nil: EmptyView()
+        }
+    }
+}
+
+extension CompactView {
+    /// "3" when several Claude sessions / commands are running at once.
+    @ViewBuilder var runningBadge: some View {
+        let n = claude.sessions.count + tasks.items.count
+        if n > 1 {
+            Text("\(n)").font(.system(size: 9, weight: .bold).monospacedDigit()).foregroundStyle(Color.black)
+                .padding(.horizontal, 4).background(theme.accent, in: Capsule())
+        }
+    }
+
+    func sensorDots(size: CGFloat) -> some View {
+        HStack(spacing: 3) {
+            if sensors.cameraOn { Circle().fill(Color.green).frame(width: size, height: size) }
+            if sensors.micApps != nil { Circle().fill(Color.orange).frame(width: size, height: size) }
         }
     }
 }
@@ -262,13 +291,14 @@ struct ExpandedView: View {
     @ObservedObject var settings = AppSettings.shared
     @ObservedObject var model = IslandModel.shared
     @ObservedObject var claude = ClaudeBridge.shared
+    @ObservedObject var tasks = TaskCenter.shared
     @Environment(\.theme) var theme
 
     private let pad: CGFloat = 14
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if let req = claude.pending.first {
+            if let req = claude.visible {
                 PermissionView(request: req, queued: claude.pending.count - 1)
             } else if let preview = model.preview {
                 var l = settings.layout
@@ -277,7 +307,7 @@ struct ExpandedView: View {
             } else if model.dragNear {
                 DropZone(height: CGFloat(settings.layout.tileHeight))
             } else {
-                if claude.working { ClaudeStatusRow() }
+                ActivityBar()
                 carousel
             }
         }
@@ -323,7 +353,7 @@ struct ExpandedView: View {
                     let size = CGSize(width: unit * CGFloat(t.width), height: CGFloat(layout.tileHeight))
                     Self.tile(t.kind)
                         .environment(\.tileSize, size)
-                        .frame(width: size.width, height: size.height)
+                        .frame(width: size.width, height: size.height, alignment: .top) // overflow goes down, never hides the header
                         .background(theme.tile, in: RoundedRectangle(cornerRadius: CGFloat(layout.corner)))
                         .clipShape(RoundedRectangle(cornerRadius: CGFloat(layout.corner)))
                 }
@@ -343,6 +373,16 @@ struct ExpandedView: View {
         case .controls: ControlsTile()
         case .battery: BatteryTile()
         case .reminders: RemindersTile()
+        case .stats: StatsTile()
+        case .launcher: LauncherTile()
+        case .countdown: CountdownTile()
+        case .colorPicker: ColorPickerTile()
+        case .notes: NotesTile()
+        case .actions: ActionsTile()
+        case .downloads: DownloadsTile()
+        case .ports: PortsTile()
+        case .git: GitTile()
+        case .docker: DockerTile()
         }
     }
 }
@@ -355,13 +395,32 @@ struct DropZone: View {
     var body: some View {
         VStack(spacing: 8) {
             Image(systemName: "tray.and.arrow.down.fill").font(.system(size: 30)).foregroundStyle(theme.accent)
-            Text("Drop to add to the Shelf").font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.text)
-            Text(shelf.files.isEmpty ? "Files stay where they are; the Shelf keeps a link."
-                                     : "\(shelf.files.count) on the Shelf").font(.system(size: 11)).foregroundStyle(theme.secondary)
+            Text("Drop files, images or text").font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.text)
+            Text("Files and images go to the Shelf, text to Quick Notes.")
+                .font(.system(size: 11)).foregroundStyle(theme.secondary)
         }
         .frame(maxWidth: .infinity, minHeight: max(height, 120))
         .background(theme.accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(theme.accent, style: StrokeStyle(lineWidth: 2, dash: [7, 5])))
+    }
+}
+
+/// Explanation text in a widget. Short widgets drop it (unless `always`) so the header and the
+/// button still fit; when shown it wraps to at most 3 lines and shrinks a little before cutting.
+struct Hint: View {
+    let text: String
+    var always = false
+    @Environment(\.theme) var theme
+    @Environment(\.tileSize) var size
+
+    init(_ text: String, always: Bool = false) { self.text = text; self.always = always }
+
+    var body: some View {
+        if always || size.height >= 125 {
+            Text(text).font(.system(size: 11)).foregroundStyle(theme.secondary)
+                .lineLimit(size.height >= 125 ? 3 : 2).minimumScaleFactor(0.85)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 

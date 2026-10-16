@@ -508,8 +508,8 @@ struct MusicTile: View {
         VStack(alignment: .leading, spacing: 6) {
             TileHeader(symbol: "music.note", title: "NOW PLAYING")
             Spacer(minLength: 0)
-            Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.text)
-            Text(detail).font(.system(size: 11)).foregroundStyle(theme.secondary).fixedSize(horizontal: false, vertical: true)
+            Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.text).lineLimit(1).minimumScaleFactor(0.8)
+            Hint(detail)
             if let button, let action {
                 Button(button, action: action).buttonStyle(FlatButtonStyle())
             }

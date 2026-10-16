@@ -14,6 +14,8 @@ enum Snapshots {
             EditorState.shared.optionsFor = AppSettings.shared.layout.pages.flatMap { $0 }.first { $0.kind == kind }?.id
         }
         if let drop = e["dropZone"] as? Bool { IslandModel.shared.setDragNear(drop) }
+        if let apps = e["volumeApps"] as? Bool { AppVolumes.shared.showApps = apps }
+        if let open = e["open"] as? Bool { IslandModel.shared.setEditing(open) } // hold the island open for a picture
         // "preview": "controls:2,battery:1", "height": 132 ; "preview": "" ends it.
         if let spec = e["preview"] as? String {
             let tiles = spec.split(separator: ",").compactMap { part -> Placement? in
@@ -30,8 +32,10 @@ enum Snapshots {
         let pb = NSPasteboard.general
         var state = "pasteboard changeCount=\(pb.changeCount) types=\((pb.types ?? []).map(\.rawValue)) "
         if #available(macOS 15.4, *) { state += "accessBehavior=\(pb.accessBehavior.rawValue) " }
+        state += "appActive=\(NSApp.isActive) keyWindow=\(NSApp.keyWindow.map { String(describing: type(of: $0)) } ?? "none") "
+        state += "screens=\(NSScreen.screens.map { "\($0.localizedName) \($0.frame) top=\($0.safeAreaInsets.top)" }) notch=\(IslandModel.shared.notch.screenFrame) "
         let c = ClaudeBridge.shared
-        state += "claudeWorking=\(c.working) step=\(c.step.verb) detail=\(c.detail) pending=\(c.pending.count) "
+        state += "claudeSessions=\(c.sessions.count) step=\(c.step.verb) detail=\(c.detail) pending=\(c.pending.count) tasks=\(TaskCenter.shared.items.count) "
         state += "clipboardItems=\(ClipboardHistory.shared.items.count) enabled=\(ClipboardHistory.shared.enabled)\n"
         try? state.write(to: folder.appendingPathComponent("state.txt"), atomically: true, encoding: .utf8)
         for (i, w) in NSApp.windows.enumerated() where w.isVisible {

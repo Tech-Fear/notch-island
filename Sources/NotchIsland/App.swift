@@ -37,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         SensorWatcher.shared.start()
         NetworkWatcher.shared.start()
         ClipboardHistory.shared.start()
+        ScreenshotWatcher.shared.setEnabled(AppSettings.shared.screenshotsToShelf)
         AudioOutput.shared.start() // also announces headphones/speakers when they connect
 
         // Now Playing and volume watch the system only while their widget is on some page.
@@ -44,12 +45,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         layout.map { $0.contains(.music) }.removeDuplicates().sink { on in
             if on { MusicController.shared.start() } else { MusicController.shared.stop() }
         }.store(in: &bag)
+        for (kind, poller) in [(TileKind.ports, PortsWatcher.shared as Poller), (.git, GitWatcher.shared), (.docker, DockerWatcher.shared)] {
+            layout.map { $0.contains(kind) }.removeDuplicates().sink { on in
+                if on { poller.start() } else { poller.stop() }
+            }.store(in: &bag)
+        }
+        layout.map { $0.contains(.stats) }.removeDuplicates().sink { on in
+            if on { SystemStats.shared.start() } else { SystemStats.shared.stop() }
+        }.store(in: &bag)
+        layout.map { $0.contains(.volume) }.removeDuplicates().sink { on in
+            if on { AppVolumes.shared.start() } else { AppVolumes.shared.stop() }
+        }.store(in: &bag)
         layout.map { $0.contains(.weather) }.removeDuplicates().dropFirst().sink { on in
             if on { WeatherService.shared.refresh() }
         }.store(in: &bag)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        AppVolumes.shared.stop() // give every tapped app its own sound back
         ClaudeBridge.shared.stop()
     }
 
@@ -85,6 +98,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("Focus / Do Not Disturb", on: s.focusPeeks) { peeks.setFocusPeeks(!s.focusPeeks) })
         if s.focusPeeks, let note = peeks.focusNote { menu.addItem(info("   " + note)) }
         menu.addItem(item("Load Spotify Covers (contacts Spotify)", on: s.spotifyCovers) { s.spotifyCovers.toggle() })
+        menu.addItem(item("New Screenshots → Shelf", on: s.screenshotsToShelf) {
+            s.screenshotsToShelf.toggle()
+            ScreenshotWatcher.shared.setEnabled(s.screenshotsToShelf)
+        })
 
         menu.addItem(.separator())
         menu.addItem(header("Claude Code"))

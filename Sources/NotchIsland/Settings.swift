@@ -4,6 +4,8 @@ import SwiftUI
 
 enum TileKind: String, CaseIterable, Identifiable, Codable {
     case music, weather, calendar, timer, volume, shelf, clipboard, controls, battery, reminders
+    case stats, launcher, countdown, colorPicker, notes, actions, downloads
+    case ports, git, docker
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -17,6 +19,16 @@ enum TileKind: String, CaseIterable, Identifiable, Codable {
         case .controls: "Controls"
         case .battery: "Battery"
         case .reminders: "Reminders"
+        case .stats: "System Stats"
+        case .launcher: "App Launcher"
+        case .countdown: "Countdown"
+        case .colorPicker: "Color Picker"
+        case .notes: "Quick Notes"
+        case .actions: "Quick Actions"
+        case .downloads: "Recent Downloads"
+        case .ports: "Ports"
+        case .git: "Git"
+        case .docker: "Docker"
         }
     }
     var symbol: String {
@@ -31,6 +43,16 @@ enum TileKind: String, CaseIterable, Identifiable, Codable {
         case .controls: "slider.horizontal.3"
         case .battery: "battery.75percent"
         case .reminders: "checklist"
+        case .stats: "cpu"
+        case .launcher: "square.grid.2x2"
+        case .countdown: "hourglass"
+        case .colorPicker: "eyedropper"
+        case .notes: "note.text"
+        case .actions: "bolt.fill"
+        case .downloads: "arrow.down.circle"
+        case .ports: "network"
+        case .git: "arrow.triangle.branch"
+        case .docker: "shippingbox"
         }
     }
 }
@@ -64,6 +86,11 @@ extension TileKind {
                          .init(id: "icons", title: "Desktop icons")]
         case .battery: [.init(id: "time", title: "Time left"), .init(id: "apps", title: "Top energy apps")]
         case .reminders: [.init(id: "complete", title: "Tick to complete")]
+        case .stats: [.init(id: "cpu", title: "CPU"), .init(id: "memory", title: "Memory"),
+                      .init(id: "disk", title: "Disk free"), .init(id: "network", title: "Network speed")]
+        case .actions: QuickAction.allCases.map { .init(id: $0.rawValue, title: $0.title) }
+        case .downloads: [.init(id: "names", title: "File names")]
+        case .launcher, .countdown, .colorPicker, .notes, .ports, .git, .docker: []
         }
     }
 }
@@ -89,9 +116,14 @@ struct IslandLayout: Codable, Equatable {
         [.init(kind: .music, width: 2), .init(kind: .weather, width: 1), .init(kind: .calendar, width: 1), .init(kind: .timer, width: 1)],
         [.init(kind: .music, width: 2), .init(kind: .volume, width: 1), .init(kind: .shelf, width: 1)],
         [.init(kind: .controls, width: 2), .init(kind: .battery, width: 1), .init(kind: .reminders, width: 1), .init(kind: .clipboard, width: 1)],
+        [.init(kind: .stats, width: 1), .init(kind: .launcher, width: 2), .init(kind: .actions, width: 1)],
+        [.init(kind: .notes, width: 1), .init(kind: .countdown, width: 1), .init(kind: .colorPicker, width: 1), .init(kind: .downloads, width: 1)],
+        [.init(kind: .git, width: 1), .init(kind: .ports, width: 1), .init(kind: .docker, width: 1)],
     ])
 
     static let newInV3: [TileKind] = [.clipboard, .controls, .battery, .reminders]
+    static let newInV4: [TileKind] = [.stats, .launcher, .countdown, .colorPicker, .notes, .actions, .downloads]
+    static let newInV5: [TileKind] = [.ports, .git, .docker]
 
     func contains(_ kind: TileKind) -> Bool { pages.contains { $0.contains { $0.kind == kind } } }
     func page(of kind: TileKind) -> Int? { pages.firstIndex { $0.contains { $0.kind == kind } } }
@@ -110,6 +142,11 @@ final class AppSettings: ObservableObject {
     @Published var parts: [String: Bool] { didSet { d.set(parts, forKey: "widgetParts") } }
     @Published var focusPeeks: Bool { didSet { d.set(focusPeeks, forKey: "focusPeeks") } }
     @Published var spotifyCovers: Bool { didSet { d.set(spotifyCovers, forKey: "spotifyCovers") } }
+    /// Folder the Git widget watches; nil = follow the latest Claude Code session.
+    @Published var gitRepo: String? { didSet { d.set(gitRepo, forKey: "gitRepo") } }
+    /// New screenshots are added to the Shelf (opt-in: reading their folder asks for access once).
+    @Published var screenshotsToShelf: Bool { didSet { d.set(screenshotsToShelf, forKey: "screenshotsToShelf") } }
+    @Published var countdown: Countdown? { didSet { d.set(try? JSONEncoder().encode(countdown), forKey: "countdown") } }
 
     private init() {
         theme = ThemeName(rawValue: d.string(forKey: "theme") ?? "") ?? .darkMatte
@@ -118,6 +155,12 @@ final class AppSettings: ObservableObject {
             // Layouts saved before these widgets existed get them once, on a new page.
             if !d.bool(forKey: "layoutV3"), !IslandLayout.newInV3.contains(where: saved.contains) {
                 l.pages.append(IslandLayout.standard.pages[2])
+            }
+            if !d.bool(forKey: "layoutV4"), !IslandLayout.newInV4.contains(where: saved.contains) {
+                l.pages += IslandLayout.standard.pages[3...4]
+            }
+            if !d.bool(forKey: "layoutV5"), !IslandLayout.newInV5.contains(where: saved.contains) {
+                l.pages.append(IslandLayout.standard.pages[5])
             }
             layout = l
         } else {
@@ -130,6 +173,11 @@ final class AppSettings: ObservableObject {
             layout = l
         }
         d.set(true, forKey: "layoutV3")
+        d.set(true, forKey: "layoutV4")
+        d.set(true, forKey: "layoutV5")
+        gitRepo = d.string(forKey: "gitRepo")
+        screenshotsToShelf = d.bool(forKey: "screenshotsToShelf")
+        countdown = d.data(forKey: "countdown").flatMap { try? JSONDecoder().decode(Countdown.self, from: $0) }
         parts = d.dictionary(forKey: "widgetParts") as? [String: Bool] ?? [:]
         city = d.string(forKey: "city") ?? ""
         focusPeeks = d.bool(forKey: "focusPeeks")
@@ -167,6 +215,8 @@ final class AppSettings: ObservableObject {
 final class CityDraft: ObservableObject {
     static let shared = CityDraft()
     @Published var text = AppSettings.shared.city
+    @Published var countdownTitle = AppSettings.shared.countdown?.title ?? ""
+    @Published var countdownDate = AppSettings.shared.countdown?.date ?? Date().addingTimeInterval(7 * 86_400)
 }
 
 // MARK: - Settings window (city + theme; layout has its own editor)
@@ -185,6 +235,17 @@ struct SettingsView: View {
                 }
                 Text("Only the city name and its coordinates are sent to Open-Meteo.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Countdown") {
+                TextField("Title", text: $draft.countdownTitle, prompt: Text("e.g. Launch"))
+                DatePicker("Date", selection: $draft.countdownDate)
+                HStack {
+                    Button("Save") {
+                        settings.countdown = Countdown(title: draft.countdownTitle.isEmpty ? "the date" : draft.countdownTitle,
+                                                       date: draft.countdownDate)
+                    }
+                    if settings.countdown != nil { Button("Clear") { settings.countdown = nil } }
+                }
             }
             Section {
                 HStack {

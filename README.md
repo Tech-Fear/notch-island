@@ -40,7 +40,7 @@ between builds, so macOS remembers the permissions you gave it. Without it, macO
 
 ## Using it
 
-- **Rest the mouse on the notch** to open the island; move away to close it. **Click** to keep it open.
+- **Rest the mouse on the notch** (or click it) to open the island; it closes as soon as the pointer leaves.
 - **Pages**: swipe sideways with two fingers or click the dots. Default pages: Now Playing, Weather, Calendar,
   Focus Timer · Now Playing, Volume, File Shelf · Controls, Battery, Reminders, Clipboard.
 - **Edit Layout…** (menu bar icon): drag widgets between pages, reorder, set widths (1–4), add or delete pages,
@@ -60,12 +60,50 @@ between builds, so macOS remembers the permissions you gave it. Without it, macO
 | Weather | Temperature, icon, high/low for the city you set |
 | Calendar | Next event, with a **Join** button for Zoom / Meet / Teams / Webex links |
 | Focus Timer | 5–90 minute presets (choose which with the gear), start/pause/reset |
-| Volume | Slider, mute, output device picker |
-| File Shelf | Drag a file toward the top of the screen and the island opens as a drop zone, or press **+**. Scroll up/down when there are many; drag files back out, double-click to open, ✕ removes one, 🗑 clears all |
+| Volume | **Output**: slider, mute, output device picker. **Apps**: each app playing sound gets its own slider and mute (Spotify 50%, Chrome 80%…; macOS 14.2+) |
+| File Shelf | Drag a file toward the top of the screen and the island opens as a drop zone, or press **+**. Scroll up/down when there are many; drag files back out (into Finder, or into a terminal to paste the path for Claude Code), double-click to open, ✕ removes one, 🗑 clears all |
 | Clipboard | Last 10 copies, in memory only, skips passwords; off until you turn it on |
 | Controls | Display brightness, keyboard backlight, keep awake, dark mode, desktop icons |
 | Battery | Level, time left, top energy users |
 | Reminders | Due today; tick to complete |
+| System Stats | CPU, memory, disk free, network up/down |
+| App Launcher | Your favourite apps; **+** to add, ✎ to remove |
+| Countdown | Days and hours to a date you set in Settings |
+| Color Picker | The system magnifier; copies the HEX, keeps recent colours |
+| Quick Notes | Short notes, stored on your Mac; opens a small window to type |
+| Quick Actions | Lock, display off, Screenshot, Mission Control |
+| Recent Downloads | Your latest downloads, draggable into Finder or a terminal |
+| Git | Branch, ahead/behind and changed files of the repo Claude is working in (or a folder you pick) |
+| Ports | Local servers that are listening; open in the browser or stop (click Stop twice) |
+| Docker | Containers with start/stop (if Docker is installed and running) |
+
+The **Clipboard** widget offers one-click tools for the latest copy when they apply: Pretty JSON,
+Decode Base64, Decode JWT, Timestamp → date.
+
+### Quick capture
+
+- **Drop on the notch**: files and images go to the Shelf, text becomes a Quick Note.
+- **New Screenshots → Shelf** (menu, off by default): screenshots you take appear on the Shelf.
+- Right-click a Shelf file for **Share…** (AirDrop, Messages, Mail…) or **AirDrop**.
+
+## The `notch` command
+
+`./install.sh` links `~/.local/bin/notch` (add `~/.local/bin` to your PATH if it isn't). Use it from any
+script or terminal:
+
+```sh
+notch "Backup finished"                 # a bubble
+notch done "Deployed"   ·   notch fail "Tests broke"
+notch run -- mvn test                   # shows it running, then Done/Failed with the time; keeps the exit code
+notch run --title "Nightly import" -- ./import.sh
+notch progress 40 "Importing"           # live % in the pill; `notch progress done "Importing"` to finish
+notch ask "Run migration on prod?" "ALTER TABLE …" && ./migrate.sh   # Yes = exit 0, No = 1, no answer = 2
+```
+
+When several things run at once (Claude sessions in different terminals, `notch run` commands, progress bars),
+the open island shows one at a time with **‹ 1/3 ›** to switch, and the pill shows how many. Waiting questions
+(Claude permissions and `notch ask`) get the same switcher. Other AI coding tools can be watched with
+`notch run -- <tool>`.
 
 ## Claude Code
 
@@ -108,6 +146,9 @@ Each is asked for only when you first use the feature.
 | Focus status | Turning on Focus bubbles in the menu | Show when Focus turns on/off |
 | Automation → Spotify / Music | Only in the fallback (see Limits) | Read and control playback |
 | Paste from other apps | Turning on Clipboard history (macOS may ask) | Keep recent copies |
+| System Audio Recording | First time you turn an app below 100% | Per-app volume (audio is played straight back, never saved or sent) |
+| Downloads folder | **Show** in Recent Downloads | List your latest downloads |
+| Screenshots folder (Desktop by default) | Turning on New Screenshots → Shelf | Add new screenshots to the Shelf |
 | Login item | Turning on Launch at Login | macOS shows its own notice |
 
 No Accessibility, Bluetooth, Location, Microphone, Camera or Screen Recording access is needed.
@@ -122,6 +163,9 @@ No Accessibility, Bluetooth, Location, Microphone, Camera or Screen Recording ac
   System Events, which asks for Automation once).
 - **Do Not Disturb**: macOS only says whether *a* Focus is on, and only if it lets a self-signed app ask.
 - **Camera in use** can't name the app; the microphone can.
+- **Per-app volume** works by muting the app and replaying its audio at your level (Core Audio process taps).
+  Nothing is muted until System Audio Recording is allowed, and if an app's replayed audio stays silent for a
+  few seconds the tap is removed so its normal sound comes back. Lock uses a private call (as Control Center does).
 - **Desktop icons** restarts Finder to apply.
 - No screen-recording indicator: macOS gives apps no reliable way to know another app is recording.
 
@@ -139,7 +183,7 @@ permissions, and offers to delete the signing certificate. Remove the hook entri
 
 ```sh
 swift build              # compile
-swift test               # unit tests (Swift Testing)
+./install.sh test        # unit tests (Swift Testing)
 ./install.sh build       # full app bundle
 ```
 
@@ -155,9 +199,13 @@ swift test               # unit tests (Swift Testing)
 | `Sources/NotchIsland/SystemTiles.swift` | Volume/output, mic/camera, file shelf |
 | `Sources/NotchIsland/MoreTiles.swift` | Clipboard, controls, battery, reminders, network, device bubbles |
 | `Sources/NotchIsland/Peeks.swift` | App, power and Focus bubbles |
+| `Sources/NotchIsland/CLITasks.swift` | `notch` command handling, running tasks, the ‹ › activity switcher |
+| `Sources/NotchIsland/DevTiles.swift` | Ports, Git, Docker, clipboard tools |
+| `Sources/NotchIsland/ExtraTiles.swift` | Stats, launcher, countdown, colour picker, notes, actions, downloads |
+| `Sources/NotchIsland/AppVolume.swift` | Per-app volume (process taps) |
 | `Sources/NotchIsland/ClaudeBridge.swift` | Socket server, Claude state, permission view, shortcuts |
 | `Sources/NotchIsland/Snapshots.swift` | Saves PNGs of the app's own windows for UI checks |
-| `Sources/NotchHook/main.swift` | The `notch-hook` helper |
+| `Sources/NotchHook/main.swift` | The `notch-hook` helper, which is also the `notch` command |
 | `Helper/nowplaying.m` | System-wide Now Playing helper |
 
 **UI snapshots** (no screen-recording permission needed): send

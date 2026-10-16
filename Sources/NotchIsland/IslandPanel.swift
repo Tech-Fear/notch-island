@@ -32,7 +32,7 @@ struct NotchGeometry: Equatable {
 // MARK: - Island state
 
 enum IslandState { case resting, compact, peek, expanded }
-enum CompactActivity { case claude, timer, music, sensor }
+enum CompactActivity { case claude, task, timer, music, sensor }
 
 struct Peek: Identifiable {
     enum Icon { case symbol(String), image(NSImage) }
@@ -63,7 +63,6 @@ final class IslandModel: ObservableObject {
     /// A file drag is in progress near the top of the screen: the island opens as a big drop zone.
     @Published private(set) var dragNear = false
     private var held = false      // a file is being dragged out of the shelf
-    private(set) var pinned = false
     private var hoverTimer: Timer?
     private var peekQueue: [(Peek, Date)] = []
     private var peekTimer: Timer?
@@ -100,17 +99,16 @@ final class IslandModel: ObservableObject {
         hoverTimer = nil
     }
 
-    // A click keeps it open; a click anywhere else lets it close again.
+    // A click opens it right away (no 0.25 s wait). It still closes as soon as the pointer leaves.
     func clickedInside() {
         cancelHoverTimer()
         hoverExpanded = true
-        pinned = true
         recompute()
     }
 
-    func clickedOutside() {
-        guard pinned else { return }
-        pinned = false
+    /// Close now, e.g. after answering Claude, even though the pointer may still be on the island.
+    func dismiss() {
+        cancelHoverTimer()
         hoverExpanded = false
         recompute()
     }
@@ -188,13 +186,14 @@ final class IslandModel: ObservableObject {
     func recompute() {
         let claude = ClaudeBridge.shared
         if claude.working { activity = .claude }
+        else if !TaskCenter.shared.items.isEmpty { activity = .task }
         else if FocusTimer.shared.running { activity = .timer }
         else if MusicController.shared.now?.playing == true { activity = .music }
         else if SensorWatcher.shared.active { activity = .sensor }
         else { activity = nil }
 
         let new: IslandState
-        if hoverExpanded || pinned || editing || preview != nil || dropOpen || dragNear || held || !claude.pending.isEmpty { new = .expanded }
+        if hoverExpanded || editing || preview != nil || dropOpen || dragNear || held || !claude.pending.isEmpty { new = .expanded }
         else if peek != nil { new = .peek }
         else if activity != nil { new = .compact }
         else { new = .resting }
@@ -295,6 +294,23 @@ final class FirstMouseHostingView<V: View>: NSHostingView<V> {
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool { superview?.performDragOperation(sender) ?? false }
 }
 
+/// What can be dropped on the island: files (Shelf), an image (saved, then Shelf) or text (a Quick Note).
+enum Dropped {
+    case files([URL]), image(Data), text(String)
+
+    init?(_ pb: NSPasteboard) {
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+            self = .files(urls)
+        } else if let data = pb.data(forType: .png) ?? pb.data(forType: .tiff) {
+            self = .image(data)
+        } else if let s = pb.string(forType: .string), !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self = .text(s)
+        } else {
+            return nil
+        }
+    }
+}
+
 /// Owns the tracking area. It covers only the visible island, so hovering the menu bar does nothing.
 final class IslandContainerView: NSView {
     var onHover: ((Bool) -> Void)?
@@ -323,27 +339,26 @@ final class IslandContainerView: NSView {
     // change) while the mouse hasn't moved, so the real position decides.
     // MARK: File drops (AppKit: SwiftUI's onDrop doesn't receive drags in this panel)
 
-    var onFilesDropped: (([URL]) -> Void)?
+    var onDropped: ((Dropped) -> Void)?
     var onDropHover: ((Bool) -> Void)?
 
-    private func fileURLs(_ info: NSDraggingInfo) -> [URL] {
-        info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
-    }
+    static let dropTypes: [NSPasteboard.PasteboardType] = [.fileURL, .png, .tiff, .string]
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard !fileURLs(sender).isEmpty else { return [] }
+        guard Dropped(sender.draggingPasteboard) != nil else { return [] }
         onDropHover?(true)
         return .copy
     }
 
-    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { fileURLs(sender).isEmpty ? [] : .copy }
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        Dropped(sender.draggingPasteboard) == nil ? [] : .copy
+    }
     override func draggingExited(_ sender: NSDraggingInfo?) { onDropHover?(false) }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let urls = fileURLs(sender)
         onDropHover?(false)
-        guard !urls.isEmpty else { return false }
-        onFilesDropped?(urls)
+        guard let dropped = Dropped(sender.draggingPasteboard) else { return false }
+        onDropped?(dropped)
         return true
     }
 
@@ -372,13 +387,23 @@ final class IslandController {
         host.autoresizingMask = [.width, .height]
         container.addSubview(host)
         container.onHover = { [weak self] inside in self?.model.mouseInside(inside) }
-        container.registerForDraggedTypes([.fileURL])
+        container.registerForDraggedTypes(IslandContainerView.dropTypes)
         container.onDropHover = { [weak self] on in self?.model.setDropTargeted(on) }
-        container.onFilesDropped = { urls in
-            guard AppSettings.shared.layout.contains(.shelf) else { return }
-            Shelf.shared.add(urls)
-            IslandModel.shared.show(Peek(icon: .symbol("tray.and.arrow.down.fill"), title: "Added to Shelf",
-                                         subtitle: urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) files", duration: 2))
+        container.onDropped = { dropped in
+            switch dropped {
+            case .files(let urls):
+                Shelf.shared.add(urls)
+                IslandModel.shared.show(Peek(icon: .symbol("tray.and.arrow.down.fill"), title: "Added to Shelf",
+                                             subtitle: urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) files", duration: 2))
+            case .image(let data):
+                guard let url = Shelf.shared.saveCapture(data) else { return }
+                Shelf.shared.add([url])
+                IslandModel.shared.show(Peek(icon: .symbol("photo"), title: "Image added to Shelf", subtitle: url.lastPathComponent, duration: 2))
+            case .text(let text):
+                Notes.shared.upsert(Note(text: text))
+                IslandModel.shared.show(Peek(icon: .symbol("note.text"), title: "Saved to Notes",
+                                             subtitle: String(text.prefix(40)), duration: 2))
+            }
         }
         panel.contentView = container
 
@@ -401,17 +426,13 @@ final class IslandController {
                 }
             }.store(in: &bag)
 
-        // Click inside pins the island open; a click anywhere else unpins it.
-        // (Mouse monitors need no permission; only keyboard monitors do.)
+        // A click on the notch opens the island at once. (Mouse monitors need no permission.)
         if let m = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown, handler: { [weak self] e in
             if e.window === self?.panel, let self {
                 let p = self.container.convert(e.locationInWindow, from: nil)
                 if self.container.hoverRect.contains(p) { self.model.clickedInside() }
             }
             return e
-        }) { monitors.append(m) }
-        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] _ in
-            MainActor.assumeIsolated { self?.model.clickedOutside() }
         }) { monitors.append(m) }
 
         // File drags: the drag pasteboard changes when a drag starts. Once a file drag comes near
@@ -432,6 +453,18 @@ final class IslandController {
             if self.model.state == .expanded { self.resize(for: .expanded, immediately: true) }
         }.store(in: &bag)
 
+        // Display changes (lid closed with a monitor, a monitor unplugged during sleep) don't always
+        // notify, and the island once stayed off-screen. Re-check its position every few seconds.
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let target = self.frame(for: self.model.state)
+                if abs(self.panel.frame.midX - target.midX) > 1 || abs(self.panel.frame.maxY - target.maxY) > 1 {
+                    self.resize(for: self.model.state, immediately: true)
+                }
+            }
+        }
+
         resize(for: model.state, immediately: true)
         panel.orderFrontRegardless()
     }
@@ -444,8 +477,8 @@ final class IslandController {
             dragCount = NSPasteboard(name: .drag).changeCount
         case .leftMouseDragged:
             let pb = NSPasteboard(name: .drag)
-            guard pb.changeCount != dragCount, pb.types?.contains(.fileURL) == true,
-                  AppSettings.shared.layout.contains(.shelf) else { return }
+            guard pb.changeCount != dragCount,
+                  pb.types?.contains(where: IslandContainerView.dropTypes.contains) == true else { return }
             let p = NSEvent.mouseLocation, screen = model.notch.screenFrame
             // Generous zone: top 180 pt of the screen, 760 pt wide around the notch.
             let near = p.y > screen.maxY - 180 && abs(p.x - screen.midX) < 380

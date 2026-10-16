@@ -199,8 +199,7 @@ struct CalendarTile: View {
                     Text("Nothing in the next 7 days").font(.system(size: 12)).foregroundStyle(theme.secondary)
                 }
             case .notDetermined:
-                Text("Shows your next event. Nothing leaves your Mac.")
-                    .font(.system(size: 11)).foregroundStyle(theme.secondary).fixedSize(horizontal: false, vertical: true)
+                Hint("Shows your next event. Nothing leaves your Mac.")
                 Button("Allow") { cal.requestAccess() }.buttonStyle(FlatButtonStyle(prominent: true))
             default:
                 Text("Calendar access is off.").font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.text)

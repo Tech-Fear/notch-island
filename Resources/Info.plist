@@ -32,6 +32,8 @@
 	<string>To show reminders due today. Nothing leaves your Mac.</string>
 	<key>NSRemindersUsageDescription</key>
 	<string>To show reminders due today. Nothing leaves your Mac.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>To change the volume of individual apps. Their audio is played back right away and never leaves your Mac.</string>
 	<key>NSFocusStatusUsageDescription</key>
 	<string>To show a bubble when Do Not Disturb turns on or off.</string>
 </dict>

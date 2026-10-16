@@ -6,12 +6,12 @@ import SwiftUI
 
 // MARK: - CoreAudio helpers
 
-private func address(_ selector: AudioObjectPropertySelector,
+func address(_ selector: AudioObjectPropertySelector,
                      _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
 }
 
-private func getValue<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
+func getValue<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
                          _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, _ initial: T) -> T? {
     var addr = address(selector, scope)
     var value = initial
@@ -19,14 +19,14 @@ private func getValue<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: Audi
     return AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &value) == noErr ? value : nil
 }
 
-private func setValue<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
+func setValue<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
                          _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, _ value: T) {
     var addr = address(selector, scope)
     var v = value
     AudioObjectSetPropertyData(obj, &addr, 0, nil, UInt32(MemoryLayout<T>.size), &v)
 }
 
-private func getArray<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
+func getArray<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector,
                          _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, of _: T.Type) -> [T] {
     var addr = address(selector, scope)
     var size: UInt32 = 0
@@ -36,7 +36,7 @@ private func getArray<T: BitwiseCopyable>(_ obj: AudioObjectID, _ selector: Audi
     return items
 }
 
-private func deviceName(_ id: AudioDeviceID) -> String {
+func deviceName(_ id: AudioDeviceID) -> String {
     var addr = address(kAudioObjectPropertyName)
     var ref: Unmanaged<CFString>?
     var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
@@ -124,6 +124,7 @@ final class AudioOutput: ObservableObject {
 
 struct VolumeTile: View {
     @ObservedObject var audio = AudioOutput.shared
+    @ObservedObject var vols = AppVolumes.shared
     @ObservedObject var settings = AppSettings.shared
     @Environment(\.theme) var theme
     @Environment(\.tileSize) var size
@@ -132,7 +133,18 @@ struct VolumeTile: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            TileHeader(symbol: "speaker.wave.2", title: "VOLUME")
+            HStack {
+                TileHeader(symbol: "speaker.wave.2", title: "VOLUME")
+                Spacer(minLength: 4)
+                // Output = whole Mac, Apps = each app on its own.
+                HStack(spacing: 2) {
+                    tab("Output", "speaker.wave.2.fill", !vols.showApps) { vols.showApps = false }
+                    tab("Apps", "square.grid.2x2.fill", vols.showApps) { vols.showApps = true }
+                }
+            }
+            if vols.showApps {
+                AppVolumeList()
+            } else {
             Spacer(minLength: 0)
             if let v = audio.volume {
                 HStack(spacing: 8) {
@@ -158,9 +170,22 @@ struct VolumeTile: View {
             .menuStyle(.borderlessButton)
             .frame(maxWidth: size.width - 24, alignment: .leading)
             .foregroundStyle(theme.text) }
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func tab(_ title: String, _ symbol: String, _ selected: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Group { if size.width >= 190 { Text(title) } else { Image(systemName: symbol) } }
+                .font(.system(size: 9, weight: .semibold))
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .foregroundStyle(selected ? Color.white : theme.secondary)
+                .background(selected ? theme.button : Color.clear, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .help(title)
     }
 }
 
@@ -282,6 +307,18 @@ final class Shelf: ObservableObject {
 
     func add(_ urls: [URL]) { for u in urls where !files.contains(u) { files.append(u) } }
 
+    /// Dropped images are saved here (they have no file of their own).
+    static let captures = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("NotchIsland/Captures", isDirectory: true)
+
+    func saveCapture(_ data: Data) -> URL? {
+        guard let rep = NSBitmapImageRep(data: data), let png = rep.representation(using: .png, properties: [:]) else { return nil }
+        try? FileManager.default.createDirectory(at: Self.captures, withIntermediateDirectories: true)
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        let url = Self.captures.appendingPathComponent("Image \(f.string(from: Date())).png")
+        return (try? png.write(to: url)) != nil ? url : nil
+    }
+
     /// The no-drag way in: a normal Open panel.
     func pick() {
         let panel = NSOpenPanel()
@@ -296,8 +333,15 @@ final class Shelf: ObservableObject {
         }
     }
 
-    func remove(_ url: URL) { files.removeAll { $0 == url } }
-    func clear() { files.removeAll() }
+    func remove(_ url: URL) { files.removeAll { $0 == url }; deleteIfCapture(url) }
+    func clear() { files.forEach(deleteIfCapture); files.removeAll() }
+
+    /// Images dropped on the notch were saved by us; your own files are never touched.
+    private func deleteIfCapture(_ url: URL) {
+        if url.deletingLastPathComponent().standardizedFileURL == Self.captures.standardizedFileURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
 }
 
 struct ShelfTile: View {
@@ -320,8 +364,7 @@ struct ShelfTile: View {
             }
             if shelf.files.isEmpty {
                 Spacer(minLength: 0)
-                Text("Drag files to the top of the screen, or press +.")
-                    .font(.system(size: 11)).foregroundStyle(theme.secondary).fixedSize(horizontal: false, vertical: true)
+                Hint("Drag files to the top of the screen, or press +.", always: true)
                 Spacer(minLength: 0)
             } else {
                 // Vertical grid: a sideways two-finger swipe stays free to flip pages.
@@ -347,6 +390,9 @@ struct ShelfTile: View {
                     .lineLimit(1).truncationMode(.middle).frame(width: 58)
             }
         }
+        .allowsHitTesting(false)
+        // Drag, double-click and right-click are handled by AppKit underneath (see FileDragSource).
+        .background(FileDragSource(url: url, onRemove: { shelf.remove(url) }))
         .overlay(alignment: .topTrailing) {
             // Remove just this file (the file itself stays where it is).
             Button { shelf.remove(url) } label: {
@@ -360,17 +406,126 @@ struct ShelfTile: View {
             .offset(x: 2, y: -4)
         }
         .padding(.top, 4)
-        .contentShape(Rectangle())
         .help(url.path)
-        .onTapGesture(count: 2) { NSWorkspace.shared.open(url) }
-        .onDrag {
-            IslandModel.shared.holdOpen(true) // the island must not close under a drag in progress
-            return NSItemProvider(contentsOf: url) ?? NSItemProvider()
+    }
+}
+
+/// AppKit drag source for a shelf file. SwiftUI's onDrag never starts a drag in this
+/// non-activating panel; beginDraggingSession does, and writes the file URL the way Finder does,
+/// so Finder copies the file and terminals (Terminal, iTerm2, IntelliJ…) paste its path.
+struct FileDragSource: NSViewRepresentable {
+    let url: URL
+    var onRemove: (() -> Void)?
+
+    func makeNSView(context: Context) -> SourceView { SourceView(url: url, onRemove: onRemove) }
+    func updateNSView(_ view: SourceView, context: Context) { view.url = url; view.onRemove = onRemove }
+
+    final class SourceView: NSView, NSDraggingSource, NSSharingServicePickerDelegate {
+        var url: URL
+        var onRemove: (() -> Void)?
+        private var down: NSEvent?
+
+        init(url: URL, onRemove: (() -> Void)?) {
+            self.url = url
+            self.onRemove = onRemove
+            super.init(frame: .zero)
         }
-        .contextMenu {
-            Button("Open") { NSWorkspace.shared.open(url) }
-            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
-            Button("Remove from Shelf") { shelf.remove(url) }
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        override func mouseDown(with event: NSEvent) {
+            down = event
+            if event.clickCount == 2 { NSWorkspace.shared.open(url) }
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard let down else { return }
+            self.down = nil
+            let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+            item.setDraggingFrame(bounds, contents: NSWorkspace.shared.icon(forFile: url.path))
+            MainActor.assumeIsolated { IslandModel.shared.holdOpen(true) } // don't close under the drag
+            beginDraggingSession(with: [item], event: down, source: self)
+        }
+
+        /// The system share menu (AirDrop, Messages, Mail…), anchored to this file.
+        private func share() {
+            MainActor.assumeIsolated { IslandModel.shared.holdOpen(true) } // keep the anchor on screen
+            let picker = NSSharingServicePicker(items: [url])
+            picker.delegate = self
+            picker.show(relativeTo: bounds, of: self, preferredEdge: .minY)
+        }
+
+        func sharingServicePicker(_ picker: NSSharingServicePicker, didChoose service: NSSharingService?) {
+            MainActor.assumeIsolated { IslandModel.shared.holdOpen(false) }
+        }
+
+        func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+            context == .outsideApplication ? [.copy, .link, .generic] : []
+        }
+
+        override func menu(for event: NSEvent) -> NSMenu? {
+            let m = NSMenu()
+            m.addItem(ClosureMenuItem(title: "Open") { [url] in NSWorkspace.shared.open(url) })
+            m.addItem(ClosureMenuItem(title: "Show in Finder") { [url] in NSWorkspace.shared.activateFileViewerSelecting([url]) })
+            m.addItem(.separator())
+            m.addItem(ClosureMenuItem(title: "Share…") { [weak self] in self?.share() })
+            if let airdrop = NSSharingService(named: .sendViaAirDrop), airdrop.canPerform(withItems: [url]) {
+                m.addItem(ClosureMenuItem(title: "AirDrop…") { [url] in airdrop.perform(withItems: [url]) })
+            }
+            if let onRemove {
+                m.addItem(.separator())
+                m.addItem(ClosureMenuItem(title: "Remove from Shelf") { onRemove() })
+            }
+            return m
+        }
+    }
+}
+
+
+// MARK: - New screenshots → Shelf (opt-in)
+
+@MainActor
+final class ScreenshotWatcher {
+    static let shared = ScreenshotWatcher()
+    private var timer: Timer?
+    private var known: Set<String> = []
+
+    /// Where macOS saves screenshots (Screenshot app › Options › Save to), Desktop by default.
+    private var folder: URL {
+        if let path = UserDefaults(suiteName: "com.apple.screencapture")?.string(forKey: "location") {
+            return URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask)[0]
+    }
+
+    func setEnabled(_ on: Bool) {
+        timer?.invalidate(); timer = nil
+        guard on else { return }
+        known = Set(names())  // only screenshots taken from now on
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.check() }
+        }
+    }
+
+    private func names() -> [String] {
+        (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.filter { !$0.hasPrefix(".") } ?? []
+    }
+
+    private func check() {
+        for name in names() where !known.contains(name) {
+            let url = folder.appendingPathComponent(name)
+            // macOS tags screenshots with this attribute, whatever the language of the file name.
+            guard getxattr(url.path, "com.apple.metadata:kMDItemIsScreenCapture", nil, 0, 0, 0) > 0 else {
+                // The tag can arrive a moment after the file; give up on files older than 10 s.
+                let created = (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast
+                if Date().timeIntervalSince(created) > 10 { known.insert(name) }
+                continue
+            }
+            known.insert(name)
+            Shelf.shared.add([url])
+            IslandModel.shared.show(Peek(icon: .symbol("camera.viewfinder"), title: "Screenshot added to Shelf",
+                                         subtitle: name, duration: 2))
         }
     }
 }

@@ -71,11 +71,52 @@ final class ClaudeBridge: ObservableObject {
     }
 
     @Published private(set) var app: SourceApp?
+    /// Folder of the latest Claude Code session (the Git widget follows it).
+    @Published private(set) var lastCwd: String?
 
-    @Published private(set) var working = false
-    @Published private(set) var step: Step = .thinking
-    @Published private(set) var detail = ""
-    @Published private(set) var startedAt: Date?
+    func askFromCLI(fd: Int32, question: String, detail: String, source: SourceApp?) {
+        let req = PermissionRequest(fd: fd, tool: "ask", headline: question, body: detail.isEmpty ? question : detail,
+                                    note: nil, project: "", always: nil, app: source)
+        if pending.isEmpty { reviewed = false }
+        pending.append(req)
+        watch(req)
+        IslandModel.shared.recompute()
+        Hotkeys.shared.update()
+    }
+
+    /// One per Claude Code session (several terminals can run Claude at once).
+    struct Session: Identifiable {
+        let id: String
+        var project: String
+        var step: Step = .thinking
+        var detail = ""
+        var startedAt = Date()
+        var updated = Date()
+        var app: SourceApp?
+    }
+
+    @Published private(set) var sessions: [Session] = []
+    /// The most recently active session drives the compact pill.
+    var current: Session? { sessions.max { $0.updated < $1.updated } }
+    var working: Bool { !sessions.isEmpty }
+    var step: Step { current?.step ?? .thinking }
+    var detail: String { current?.detail ?? "" }
+    var startedAt: Date? { current?.startedAt }
+
+    private func updateSession(_ id: String, project: String, app: SourceApp?, restart: Bool, _ change: (inout Session) -> Void) {
+        if let i = sessions.firstIndex(where: { $0.id == id }) {
+            if restart { sessions[i].startedAt = Date() }
+            sessions[i].updated = Date()
+            if let app { sessions[i].app = app }
+            change(&sessions[i])
+        } else {
+            var s = Session(id: id, project: project, app: app)
+            change(&s)
+            sessions.append(s)
+        }
+        // A session whose Stop never arrived (terminal closed) is dropped after 30 quiet minutes.
+        sessions.removeAll { Date().timeIntervalSince($0.updated) > 1800 }
+    }
     @Published private(set) var pending: [PermissionRequest] = []
     /// True once the whole body of the front request has been on screen; until then Allow is disabled.
     @Published var reviewed = false
@@ -157,17 +198,23 @@ final class ClaudeBridge: ObservableObject {
         let input = e["tool_input"] as? [String: Any] ?? [:]
         let project = ((e["cwd"] as? String) as NSString?)?.lastPathComponent ?? ""
         let source = SourceApp(bundleID: e["notch_app_bundle"] as? String, termProgram: e["notch_term_program"] as? String)
-        if let source, event != "NotchIslandSnapshot" { app = source }
+        let sid = e["session_id"] as? String ?? "default"
+        if let source, event != "NotchIslandSnapshot", event != "NotchCLI" { app = source }
+        if let cwd = e["cwd"] as? String, !cwd.isEmpty, event != "NotchCLI" { lastCwd = cwd }
 
         switch event {
         case "UserPromptSubmit":
             close(fd)
-            startedAt = Date(); working = true; step = .thinking; detail = project
+            updateSession(sid, project: project, app: source, restart: true) { $0.step = .thinking; $0.detail = project }
         case "PreToolUse":
             close(fd)
-            if !working { working = true; startedAt = startedAt ?? Date() }
-            step = Self.step(for: tool)
-            detail = Self.shortDetail(tool: tool, input: input)
+            updateSession(sid, project: project, app: source, restart: false) {
+                $0.step = Self.step(for: tool)
+                $0.detail = Self.shortDetail(tool: tool, input: input)
+            }
+        case "NotchCLI":
+            handleCLI(e, fd: fd, source: source)
+            return
         case "PermissionRequest":
             // Keep the connection open: notch-hook waits for our answer.
             let (headline, body, note) = Self.describe(tool: tool, input: input)
@@ -190,8 +237,8 @@ final class ClaudeBridge: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { Snapshots.save() }
         case "Stop":
             close(fd)
-            let took = startedAt.map { Date().timeIntervalSince($0) }
-            working = false; startedAt = nil; detail = ""
+            let took = sessions.first { $0.id == sid }.map { Date().timeIntervalSince($0.startedAt) }
+            sessions.removeAll { $0.id == sid }
             IslandModel.shared.show(Peek(icon: .symbol("checkmark.circle.fill"), title: "Done",
                                          subtitle: took.map { "Took " + Self.duration($0) + (project.isEmpty ? "" : " · \(project)") + (source.map { " · \($0.name)" } ?? "") },
                                          duration: 4))
@@ -203,7 +250,7 @@ final class ClaudeBridge: ObservableObject {
     }
 
     /// If notch-hook goes away (timeout, Ctrl-C), drop the request.
-    private func watch(_ r: PermissionRequest) {
+    func watch(_ r: PermissionRequest) {
         let src = DispatchSource.makeReadSource(fileDescriptor: r.fd, queue: .main)
         src.setEventHandler { [weak self] in
             var b: UInt8 = 0
@@ -216,15 +263,26 @@ final class ClaudeBridge: ObservableObject {
     private func drop(_ r: PermissionRequest) {
         watchers.removeValue(forKey: r.fd)?.cancel()
         close(r.fd)
-        let wasFront = pending.first?.id == r.id
+        let wasShown = visible?.id == r.id
         pending.removeAll { $0.id == r.id }
-        if wasFront { reviewed = false }
+        if wasShown { reviewed = false }
+        shown = min(shown, max(pending.count - 1, 0))
         IslandModel.shared.recompute()
         Hotkeys.shared.update()
     }
 
+    /// Which waiting question is on screen (‹ › switches); Yes/No and the shortcuts answer that one.
+    @Published private(set) var shown = 0
+    var visible: PermissionRequest? { pending.isEmpty ? nil : pending[min(shown, pending.count - 1)] }
+
+    func showPending(_ delta: Int) {
+        guard pending.count > 1 else { return }
+        shown = (min(shown, pending.count - 1) + delta + pending.count) % pending.count
+        reviewed = false // the newly shown command must be seen in full too
+    }
+
     func answerFront(_ a: Answer) {
-        guard let r = pending.first, reviewed || a == .no, a != .always || r.always != nil else { return }
+        guard let r = visible, reviewed || a == .no, a != .always || r.always != nil else { return }
         answer(r, a)
     }
 
@@ -233,6 +291,7 @@ final class ClaudeBridge: ObservableObject {
         let msg = switch a { case .yes: "allow\n"; case .always: "always\n"; case .no: "deny\t\(reason)\n" }
         _ = msg.withCString { write(r.fd, $0, strlen($0)) }
         drop(r)
+        if pending.isEmpty { IslandModel.shared.dismiss() } // answered: close, even with the pointer still on it
     }
 
     // MARK: Text
@@ -360,22 +419,23 @@ final class Hotkeys {
 // MARK: - Views
 
 struct ClaudeStatusRow: View {
-    @ObservedObject var claude = ClaudeBridge.shared
+    let session: ClaudeBridge.Session
     @Environment(\.theme) var theme
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: claude.step.symbol).foregroundStyle(theme.accent)
-            Text("Claude · \(claude.step.verb)").font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.text)
-            Text(claude.detail).font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.secondary)
+            Image(systemName: session.step.symbol).foregroundStyle(theme.accent)
+            Text("Claude · \(session.step.verb)").font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.text)
+            Text(session.detail).font(.system(size: 11, design: .monospaced)).foregroundStyle(theme.secondary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer()
-            if let start = claude.startedAt {
-                TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                    Text(ClaudeBridge.duration(ctx.date.timeIntervalSince(start)))
-                        .font(.system(size: 11).monospacedDigit()).foregroundStyle(theme.secondary)
-                }
+            if !session.project.isEmpty {
+                Text(session.project).font(.system(size: 10)).foregroundStyle(theme.secondary).lineLimit(1)
             }
-            if let app = claude.app, let icon = app.icon {
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                Text(ClaudeBridge.duration(ctx.date.timeIntervalSince(session.startedAt)))
+                    .font(.system(size: 11).monospacedDigit()).foregroundStyle(theme.secondary)
+            }
+            if let app = session.app, let icon = app.icon {
                 Button { app.activate() } label: { Image(nsImage: icon).resizable().frame(width: 16, height: 16) }
                     .buttonStyle(.plain).help("Go to \(app.name)")
             }
@@ -426,8 +486,19 @@ struct PermissionView: View {
                     .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(theme.secondary)
                     .help("Go to \(app.name)")
                 }
-                Text(request.project + (queued > 0 ? " · \(queued) more waiting" : ""))
-                    .font(.system(size: 11)).foregroundStyle(theme.secondary)
+                if !request.project.isEmpty {
+                    Text(request.project).font(.system(size: 11)).foregroundStyle(theme.secondary)
+                }
+                if queued > 0 {
+                    // Several questions waiting (Claude sessions, `notch ask`): flip between them.
+                    HStack(spacing: 2) {
+                        TileButton(symbol: "chevron.left", size: 10) { claude.showPending(-1) }
+                        Text("\(min(claude.shown, queued) + 1)/\(queued + 1)").font(.system(size: 10, weight: .semibold).monospacedDigit())
+                            .foregroundStyle(theme.secondary)
+                        TileButton(symbol: "chevron.right", size: 10) { claude.showPending(1) }
+                    }
+                    .help("\(queued + 1) waiting for an answer")
+                }
             }
             if let note = request.note {
                 Text(note).font(.system(size: 11)).foregroundStyle(theme.secondary).fixedSize(horizontal: false, vertical: true)

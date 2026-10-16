@@ -5,6 +5,7 @@
 #   ./install.sh build         build only (build/NotchIsland.app); used by CI
 #   ./install.sh uninstall     quit and remove the app, its data and its permissions
 #   ./install.sh hooks         print the Claude Code hook settings for this install
+#   ./install.sh test          run the unit tests
 #
 # Options:
 #   --no-cert     don't create the local signing certificate (ad-hoc signature instead;
@@ -28,7 +29,7 @@ MIN_MACOS="14.0"
 ACTION="install"; MAKE_CERT=1; LAUNCH=1
 for arg in "$@"; do
   case "$arg" in
-    install|build|uninstall|hooks) ACTION="$arg" ;;
+    install|build|uninstall|hooks|test) ACTION="$arg" ;;
     --no-cert) MAKE_CERT=0 ;;
     --no-launch) LAUNCH=0 ;;
     -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -141,6 +142,11 @@ install_app() {
   rm -rf "$DEST"
   cp -R "$BUILT" "$DEST"
   say "Installed $DEST"
+  # The `notch` command for scripts: a link to the helper inside the app (user folder, no sudo).
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$DEST/Contents/MacOS/notch-hook" "$HOME/.local/bin/notch"
+  say "Command: ~/.local/bin/notch  (try: notch run -- sleep 3)"
+  [[ ":$PATH:" == *":$HOME/.local/bin:"* ]] || warn "~/.local/bin is not in your PATH; add it to use 'notch' by name."
 }
 
 print_hooks() {
@@ -167,6 +173,7 @@ uninstall_app() {
   [[ -x "$DEST/Contents/MacOS/$APP_NAME" ]] && "$DEST/Contents/MacOS/$APP_NAME" --unregister-login-item 2>/dev/null || true
   quit_app
   rm -rf "$DEST" "$BUILT"
+  [[ -L "$HOME/.local/bin/notch" ]] && rm -f "$HOME/.local/bin/notch"
   rm -rf "$HOME/Library/Application Support/NotchIsland" "$HOME/Library/Caches/$BUNDLE_ID"
   defaults delete "$BUNDLE_ID" 2>/dev/null || true
   tccutil reset All "$BUNDLE_ID" >/dev/null 2>&1 || true
@@ -199,4 +206,8 @@ case "$ACTION" in
     uninstall_app ;;
   hooks)
     print_hooks ;;
+  test)
+    # The Command Line Tools keep the Swift Testing macro plugin in a folder SwiftPM doesn't always search.
+    plugins="$(dirname "$(xcrun --find swift)")/../lib/swift/host/plugins/testing"
+    if [[ -d "$plugins" ]]; then swift test -Xswiftc -plugin-path -Xswiftc "$plugins"; else swift test; fi ;;
 esac

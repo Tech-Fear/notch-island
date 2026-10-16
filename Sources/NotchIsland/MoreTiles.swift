@@ -70,14 +70,14 @@ struct ClipboardTile: View {
             }
             if !clip.enabled {
                 Spacer(minLength: 0)
-                Text("Keeps the last 10 things you copy, only in memory. Skips passwords.")
-                    .font(.system(size: 11)).foregroundStyle(theme.secondary).fixedSize(horizontal: false, vertical: true)
+                Hint("Keeps the last 10 things you copy, only in memory. Skips passwords.")
                 Button("Turn On") { clip.setEnabled(true) }.buttonStyle(FlatButtonStyle(prominent: true))
             } else if clip.items.isEmpty {
                 Spacer(minLength: 0)
                 Text("Copy something and it shows up here.").font(.system(size: 11)).foregroundStyle(theme.secondary)
                 Spacer(minLength: 0)
             } else {
+                if let latest = clip.items.first { ClipToolsRow(text: latest) }
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(clip.items, id: \.self) { text in
@@ -240,7 +240,8 @@ struct ControlsTile: View {
         VStack(alignment: .leading, spacing: 7) {
             TileHeader(symbol: "slider.horizontal.3", title: "CONTROLS")
             Spacer(minLength: 0)
-            if on("brightness"), let b = c.brightness {
+            // Very small: the toggles matter most, the slider goes.
+            if on("brightness"), size.height >= 120 || size.width >= 150, let b = c.brightness {
                 row("sun.max.fill") { FlatSlider(value: Double(b)) { c.setBrightness(Float($0)) } }
             }
             // The keyboard slider goes first when the widget is short.
@@ -448,8 +449,7 @@ struct RemindersTile: View {
                 }
             case .notDetermined:
                 Spacer(minLength: 0)
-                Text("Shows reminders due today. Nothing leaves your Mac.")
-                    .font(.system(size: 11)).foregroundStyle(theme.secondary).fixedSize(horizontal: false, vertical: true)
+                Hint("Shows reminders due today. Nothing leaves your Mac.")
                 Button("Allow") { rem.requestAccess() }.buttonStyle(FlatButtonStyle(prominent: true))
             default:
                 Spacer(minLength: 0)
