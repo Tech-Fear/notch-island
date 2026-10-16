@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15]
+        os: [macos-15, macos-26, macos-27] //macos-14 removing handling due to some missing lib 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

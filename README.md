@@ -22,8 +22,8 @@ it to `~/Applications/NotchIsland.app`, starts it, and prints the Claude Code ho
 
 | | Needed |
 |---|---|
-| macOS | 14 Sonoma or later (runs on 14.0+) |
-| To build | Swift 6: Command Line Tools 16 or Xcode 16+ (`xcode-select --install`; macOS 14.5+ to install them) |
+| macOS | 15 Sequoia or later (runs on 15.0+) |
+| To build | Swift 6: Command Line Tools 16 or Xcode 16+ (`xcode-select --install`; macOS 15.0+ to install them) |
 | Mac | Apple Silicon or Intel (built for the Mac it's run on) |
 
 Other commands:
@@ -60,7 +60,7 @@ between builds, so macOS remembers the permissions you gave it. Without it, macO
 | Weather | Temperature, icon, high/low for the city you set |
 | Calendar | Next event, with a **Join** button for Zoom / Meet / Teams / Webex links |
 | Focus Timer | 5–90 minute presets (choose which with the gear), start/pause/reset |
-| Volume | **Output**: slider, mute, output device picker. **Apps**: each app playing sound gets its own slider and mute (Spotify 50%, Chrome 80%…; macOS 14.2+) |
+| Volume | **Output**: slider, mute, output device picker. **Apps**: each app playing sound gets its own slider and mute (Spotify 50%, Chrome 80%…; macOS 15.0+) |
 | File Shelf | Drag a file toward the top of the screen and the island opens as a drop zone, or press **+**. Scroll up/down when there are many; drag files back out (into Finder, or into a terminal to paste the path for Claude Code), double-click to open, ✕ removes one, 🗑 clears all |
 | Clipboard | Last 10 copies, in memory only, skips passwords; off until you turn it on |
 | Controls | Display brightness, keyboard backlight, keep awake, dark mode, desktop icons |
