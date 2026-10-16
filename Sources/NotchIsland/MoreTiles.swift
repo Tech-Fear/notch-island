@@ -45,10 +45,16 @@ final class ClipboardHistory: ObservableObject {
         if items.count > 10 { items.removeLast() }
     }
 
+    /// The row that says "Copied" for a moment, right where you clicked.
+    @Published private(set) var justCopied: String?
+
     func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        IslandModel.shared.show(Peek(icon: .symbol("doc.on.clipboard"), title: "Copied", subtitle: String(text.prefix(40)), duration: 2))
+        justCopied = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak self] in
+            if self?.justCopied == text { self?.justCopied = nil }
+        }
     }
 
     func clear() { items = [] }
@@ -81,8 +87,9 @@ struct ClipboardTile: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(clip.items, id: \.self) { text in
-                            Text(text.replacingOccurrences(of: "\n", with: " "))
-                                .font(.system(size: 11)).foregroundStyle(theme.text).lineLimit(1)
+                            Text(clip.justCopied == text ? "Copied ✓" : text.replacingOccurrences(of: "\n", with: " "))
+                                .font(.system(size: 11, weight: clip.justCopied == text ? .semibold : .regular))
+                                .foregroundStyle(clip.justCopied == text ? Color.green : theme.text).lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.horizontal, 6).padding(.vertical, 3)
                                 .background(theme.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 5))

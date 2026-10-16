@@ -217,6 +217,9 @@ final class SensorWatcher: ObservableObject {
     @Published private(set) var micApps: [String]? // nil: microphone not in use
     @Published private(set) var cameraOn = false
     private var timer: Timer?
+    private var polling = false
+    /// CoreAudio / CoreMediaIO can stall for seconds when their daemons are busy: never on the main thread.
+    private static let queue = DispatchQueue(label: "NotchIsland.sensors", qos: .utility)
 
     var active: Bool { micApps != nil || cameraOn }
 
@@ -228,8 +231,15 @@ final class SensorWatcher: ObservableObject {
     }
 
     private func poll() {
-        let mic = Self.micUsers()
-        let cam = Self.cameraRunning()
+        guard !polling else { return } // a slow answer never piles up more questions
+        polling = true
+        Self.queue.async {
+            let mic = Self.micUsers(), cam = Self.cameraRunning()
+            DispatchQueue.main.async { MainActor.assumeIsolated { self.polling = false; self.apply(mic: mic, cam: cam) } }
+        }
+    }
+
+    private func apply(mic: [String]?, cam: Bool) {
         if mic != nil, micApps == nil {
             let names = mic!.isEmpty ? nil : mic!.joined(separator: ", ")
             IslandModel.shared.show(Peek(icon: .symbol("mic.fill"), title: "Microphone in use", subtitle: names))
@@ -243,8 +253,8 @@ final class SensorWatcher: ObservableObject {
         }
     }
 
-    /// Apps recording from any input (per-app list on macOS 14+). [] = in use, app unknown.
-    private static func micUsers() -> [String]? {
+    /// Apps recording from any input (per-app list). [] = in use, app unknown.
+    nonisolated private static func micUsers() -> [String]? {
         let system = AudioObjectID(kAudioObjectSystemObject)
         let processes = getArray(system, kAudioHardwarePropertyProcessObjectList, of: AudioObjectID.self)
         if !processes.isEmpty {
@@ -262,7 +272,7 @@ final class SensorWatcher: ObservableObject {
         return running != 0 ? [] : nil
     }
 
-    private static func cameraRunning() -> Bool {
+    nonisolated private static func cameraRunning() -> Bool {
         var addr = CMIOObjectPropertyAddress(mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyDevices),
                                              mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
                                              mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain))
@@ -410,6 +420,76 @@ struct ShelfTile: View {
     }
 }
 
+/// Apps such as Slack are often not allowed into Desktop / Documents / Downloads (Privacy & Security →
+/// Files & Folders), and a drag from any app but Finder doesn't let them in: the drop silently fails.
+/// So those apps get a clone of the file from a folder anyone can read (instant on APFS, no extra space);
+/// Finder, terminals and editors still get the real file, so a path pasted into a terminal is the real one.
+enum DragHandoff {
+    static let folder = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("dev.local.NotchIsland/Drag")
+    private static let realPathApps = [
+        "com.apple.finder", "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.", "com.mitchellh.ghostty",
+        "net.kovidgoyal.kitty", "org.alacritty", "com.jetbrains.", "com.google.android.studio", "com.microsoft.VSCode",
+        "com.todesktop.", "com.sublimetext.", "dev.zed.", "com.apple.dt.Xcode", "com.panic.Nova",
+    ]
+
+    /// The file to hand to `destination` (a bundle id; nil when unknown).
+    static func url(for file: URL, destination: String?) -> URL {
+        if let d = destination, realPathApps.contains(where: d.hasPrefix) { return file }
+        guard isProtected(file) else { return file }
+        return stage(file) ?? file
+    }
+
+    static func isProtected(_ url: URL, home: String = FileManager.default.homeDirectoryForCurrentUser.path) -> Bool {
+        ["Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/CloudStorage"]
+            .contains { url.standardizedFileURL.path.hasPrefix(home + "/" + $0 + "/") }
+    }
+
+    /// A hard link under the Caches folder, same name: the same file under a second name, no copy (a symlink
+    /// wouldn't do: macOS follows it back to the protected folder). Folders and files on other drives can't be
+    /// hard-linked, so those get an APFS clone. Removed a minute after the drop (see `remove`).
+    static func stage(_ file: URL) -> URL? {
+        removeAll(olderThan: 120) // anything a crash or quit left behind
+        let fm = FileManager.default
+        let dest = folder.appendingPathComponent(UUID().uuidString).appendingPathComponent(file.lastPathComponent)
+        do {
+            try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+            do { try fm.linkItem(at: file, to: dest) } catch { try fm.copyItem(at: file, to: dest) }
+            return dest
+        } catch { return nil }
+    }
+
+    /// Deletes a handed-off link once the receiving app has had time to read it.
+    static func remove(_ staged: URL, after seconds: Double = 60) {
+        guard staged.path.hasPrefix(folder.path + "/") else { return } // only ever our own handoffs
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + seconds) {
+            try? FileManager.default.removeItem(at: staged.deletingLastPathComponent())
+        }
+    }
+
+    static func removeAll(olderThan seconds: Double = 0) {
+        let fm = FileManager.default
+        let old = Date().addingTimeInterval(-seconds)
+        for dir in (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.creationDateKey])) ?? [] {
+            if let made = (try? dir.resourceValues(forKeys: [.creationDateKey]))?.creationDate, made <= old { try? fm.removeItem(at: dir) }
+        }
+    }
+
+    /// The app whose window is under the pointer (window owners are visible without Screen Recording).
+    static func appUnderPointer() -> String? {
+        var below = 0
+        for _ in 0..<8 { // skip our own windows (the island, the drag image) on the way down
+            let n = NSWindow.windowNumber(at: NSEvent.mouseLocation, belowWindowWithWindowNumber: below)
+            guard n > 0, let info = (CGWindowListCopyWindowInfo(.optionIncludingWindow, CGWindowID(n)) as? [[String: Any]])?.first,
+                  let pid = info[kCGWindowOwnerPID as String] as? pid_t else { return nil }
+            if pid != getpid() { return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier }
+            below = n
+        }
+        return nil
+    }
+}
+
 /// AppKit drag source for a shelf file. SwiftUI's onDrag never starts a drag in this
 /// non-activating panel; beginDraggingSession does, and writes the file URL the way Finder does,
 /// so Finder copies the file and terminals (Terminal, iTerm2, IntelliJ…) paste its path.
@@ -420,7 +500,7 @@ struct FileDragSource: NSViewRepresentable {
     func makeNSView(context: Context) -> SourceView { SourceView(url: url, onRemove: onRemove) }
     func updateNSView(_ view: SourceView, context: Context) { view.url = url; view.onRemove = onRemove }
 
-    final class SourceView: NSView, NSDraggingSource, NSSharingServicePickerDelegate {
+    final class SourceView: NSView, NSDraggingSource, NSSharingServicePickerDelegate, NSPasteboardItemDataProvider {
         var url: URL
         var onRemove: (() -> Void)?
         private var down: NSEvent?
@@ -442,7 +522,11 @@ struct FileDragSource: NSViewRepresentable {
         override func mouseDragged(with event: NSEvent) {
             guard let down else { return }
             self.down = nil
-            let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+            // The file URL is filled in when the app under the pointer asks for it, so it can be the real file
+            // or a readable clone depending on that app (see DragHandoff).
+            let data = NSPasteboardItem()
+            data.setDataProvider(self, forTypes: [.fileURL])
+            let item = NSDraggingItem(pasteboardWriter: data)
             item.setDraggingFrame(bounds, contents: NSWorkspace.shared.icon(forFile: url.path))
             MainActor.assumeIsolated { IslandModel.shared.holdOpen(true) } // don't close under the drag
             beginDraggingSession(with: [item], event: down, source: self)
@@ -460,6 +544,19 @@ struct FileDragSource: NSViewRepresentable {
             MainActor.assumeIsolated { IslandModel.shared.holdOpen(false) }
         }
 
+        func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
+            let file = DragHandoff.url(for: url, destination: DragHandoff.appUnderPointer())
+            if file != url { staged = file }
+            item.setString(file.absoluteString, forType: .fileURL)
+        }
+
+        private var staged: URL?
+
+        func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+            if let staged { DragHandoff.remove(staged) } // the app has a minute to read it, then it's gone
+            staged = nil
+        }
+
         func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
             context == .outsideApplication ? [.copy, .link, .generic] : []
         }
@@ -468,6 +565,9 @@ struct FileDragSource: NSViewRepresentable {
             let m = NSMenu()
             m.addItem(ClosureMenuItem(title: "Open") { [url] in NSWorkspace.shared.open(url) })
             m.addItem(ClosureMenuItem(title: "Show in Finder") { [url] in NSWorkspace.shared.activateFileViewerSelecting([url]) })
+            if ViewerMode.forFile(url) != nil {
+                m.addItem(ClosureMenuItem(title: "Open in Viewer") { [url] in MainActor.assumeIsolated { ViewerWindow.shared.open(file: url) } })
+            }
             m.addItem(.separator())
             m.addItem(ClosureMenuItem(title: "Share…") { [weak self] in self?.share() })
             if let airdrop = NSSharingService(named: .sendViaAirDrop), airdrop.canPerform(withItems: [url]) {
@@ -504,16 +604,31 @@ final class ScreenshotWatcher {
         guard on else { return }
         known = Set(names())  // only screenshots taken from now on
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.check() }
+            MainActor.assumeIsolated { self?.scan() }
         }
     }
 
-    private func names() -> [String] {
+    private func names() -> [String] { Self.list(folder) }
+
+    nonisolated private static func list(_ folder: URL) -> [String] {
         (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.filter { !$0.hasPrefix(".") } ?? []
     }
 
-    private func check() {
-        for name in names() where !known.contains(name) {
+    private var scanning = false
+
+    /// A big or iCloud-synced Desktop can take a while to list: do that off the main thread.
+    private func scan() {
+        guard !scanning else { return }
+        scanning = true
+        let folder = folder
+        DispatchQueue.global(qos: .utility).async {
+            let names = Self.list(folder)
+            DispatchQueue.main.async { MainActor.assumeIsolated { self.scanning = false; self.check(names) } }
+        }
+    }
+
+    private func check(_ names: [String]) {
+        for name in names where !known.contains(name) {
             let url = folder.appendingPathComponent(name)
             // macOS tags screenshots with this attribute, whatever the language of the file name.
             guard getxattr(url.path, "com.apple.metadata:kMDItemIsScreenCapture", nil, 0, 0, 0) > 0 else {

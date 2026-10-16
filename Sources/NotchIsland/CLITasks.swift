@@ -102,6 +102,9 @@ extension ClaudeBridge {
         let action = e["action"] as? String ?? ""
         let title = (e["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         switch action {
+        case "view":
+            close(fd)
+            if let path = e["path"] as? String { ViewerWindow.shared.open(file: URL(fileURLWithPath: path)) }
         case "say":
             close(fd)
             IslandModel.shared.show(Peek(icon: source?.icon.map(Peek.Icon.image) ?? .symbol("text.bubble.fill"),

@@ -18,6 +18,7 @@ final class SystemStats: ObservableObject {
     private var timer: Timer?
     private var lastTicks: [UInt32]?
     private var lastNet: (rx: UInt64, tx: UInt64, at: Date)?
+    private var lastDisk = Date.distantPast
 
     func start() {
         guard timer == nil else { return }
@@ -51,8 +52,16 @@ final class SystemStats: ObservableObject {
             let page = Double(vm_kernel_page_size)
             memUsed = Double(UInt64(vm.active_count) + UInt64(vm.wire_count) + UInt64(vm.compressor_page_count)) * page
         }
-        if let v = try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-           let free = v.volumeAvailableCapacityForImportantUsage { diskFree = Double(free) }
+        // Free space asks the purgeable-space service, which can take seconds on some Macs (Time Machine
+        // snapshots, busy disks): once a minute, off the main thread.
+        if Date().timeIntervalSince(lastDisk) > 60 {
+            lastDisk = Date()
+            DispatchQueue.global(qos: .utility).async {
+                guard let v = try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+                      let free = v.volumeAvailableCapacityForImportantUsage else { return }
+                DispatchQueue.main.async { MainActor.assumeIsolated { self.diskFree = Double(free) } }
+            }
+        }
         // Network: bytes in/out on en* interfaces since the last sample.
         var rx: UInt64 = 0, tx: UInt64 = 0
         var list: UnsafeMutablePointer<ifaddrs>?
@@ -292,8 +301,17 @@ final class ColorPicks: ObservableObject {
         recent.removeAll { $0 == hex }
         recent.insert(hex, at: 0)
         if recent.count > 8 { recent.removeLast() }
-        IslandModel.shared.show(Peek(icon: .symbol("eyedropper"), title: "Copied \(hex)", subtitle: nil, duration: 2))
+        justCopied = hex
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak self] in
+            if self?.justCopied == hex { self?.justCopied = nil }
+        }
+        // Picked from the screen, the island is closed: say it in the notch. Clicked in the widget: on the swatch.
+        if IslandModel.shared.state != .expanded {
+            IslandModel.shared.show(Peek(icon: .symbol("eyedropper"), title: "Copied \(hex)", subtitle: nil, duration: 2))
+        }
     }
+
+    @Published private(set) var justCopied: String?
 }
 
 struct ColorPickerTile: View {
@@ -332,8 +350,14 @@ struct ColorPickerTile: View {
                         RoundedRectangle(cornerRadius: 4).fill(Color(hex: UInt32(hex.dropFirst(), radix: 16) ?? 0))
                             .frame(height: 16)
                             .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(theme.secondary.opacity(0.3)))
+                            .overlay {
+                                if picks.justCopied == hex {
+                                    Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)).foregroundStyle(.white)
+                                        .shadow(radius: 1)
+                                }
+                            }
                     }
-                    .buttonStyle(.plain).help("Copy \(hex)")
+                    .buttonStyle(.plain).help(picks.justCopied == hex ? "Copied \(hex)" : "Copy \(hex)")
                 }
             }
     }
@@ -564,15 +588,27 @@ final class RecentDownloads: ObservableObject {
         refresh()
     }
 
+    private var loading = false
+
+    /// A Downloads folder can hold thousands of files: listed off the main thread, so the island opens at once.
     func refresh() {
-        guard allowed, let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return }
-        let keys: [URLResourceKey] = [.addedToDirectoryDateKey, .creationDateKey]
-        let items = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
-        func added(_ u: URL) -> Date {
-            let v = try? u.resourceValues(forKeys: Set(keys))
-            return v?.addedToDirectoryDate ?? v?.creationDate ?? .distantPast
+        guard allowed, !loading, let dir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else { return }
+        loading = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let keys: [URLResourceKey] = [.addedToDirectoryDateKey, .creationDateKey]
+            let items = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])) ?? []
+            let dated = items.map { u -> (URL, Date) in
+                let v = try? u.resourceValues(forKeys: Set(keys))
+                return (u, v?.addedToDirectoryDate ?? v?.creationDate ?? .distantPast)
+            }
+            let latest = Array(dated.sorted { $0.1 > $1.1 }.prefix(12).map(\.0))
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self.loading = false
+                    if latest != self.files { self.files = latest }
+                }
+            }
         }
-        files = Array(items.sorted { added($0) > added($1) }.prefix(12))
     }
 }
 

@@ -3,7 +3,7 @@ import AudioToolbox
 import CoreAudio
 import SwiftUI
 
-// MARK: - Per-app volume (Core Audio process taps, macOS 14.2+)
+// MARK: - Per-app volume (Core Audio process taps)
 //
 // macOS has no per-app volume. For an app you turn down, a process tap captures its audio and
 // mutes the original; a private aggregate device plays the captured audio to your output at the
@@ -109,7 +109,6 @@ final class AppTap {
     let gain = UnsafeMutablePointer<Float>.allocate(capacity: 1)
     let peak = UnsafeMutablePointer<Float>.allocate(capacity: 1)
 
-    @available(macOS 14.2, *)
     init?(processes: [AudioObjectID], gain value: Float, outputUID: String) {
         self.processes = processes
         gain.pointee = value
@@ -154,7 +153,7 @@ final class AppTap {
             self.procID = nil
         }
         if aggregateID != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(aggregateID); aggregateID = AudioObjectID(kAudioObjectUnknown) }
-        if #available(macOS 14.2, *), tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID); tapID = AudioObjectID(kAudioObjectUnknown) }
+        if tapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tapID); tapID = AudioObjectID(kAudioObjectUnknown) }
     }
 
     deinit {
@@ -178,15 +177,13 @@ final class AppVolumes: ObservableObject {
     /// Apps whose tap stayed silent: tap removed so their own sound came back. Cleared when you move the slider.
     private var failed: Set<String> = []
 
-    static var supported: Bool { if #available(macOS 14.2, *) { true } else { false } }
-
     private var taps: [String: AppTap] = [:]
     private var timer: Timer?
     private var silentChecks: [String: Int] = [:]
     private var outputUID: String?
 
     func start() {
-        guard Self.supported, timer == nil else { return }
+        guard timer == nil else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refresh() }
         }
@@ -235,15 +232,26 @@ final class AppVolumes: ObservableObject {
         refresh()
     }
 
-    private func refresh() {
-        let system = AudioObjectID(kAudioObjectSystemObject)
-        let output = getValue(system, kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, AudioDeviceID(0)) ?? 0
-        let uid = stringProperty(output, kAudioDevicePropertyDeviceUID)
-        if uid != outputUID { outputUID = uid; taps.values.forEach { $0.release() }; taps.removeAll() }
+    private var scanning = false
 
-        // Group audio processes by the regular app that owns them.
+    /// The audio-process scan can stall when coreaudiod is busy: it runs off the main thread, the rest here.
+    private func refresh() {
+        guard !scanning else { return }
+        scanning = true
         let running = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
         let ids = running.compactMap(\.bundleIdentifier)
+        DispatchQueue.global(qos: .utility).async {
+            let (uid, groups) = Self.scan(ids)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { self.scanning = false; self.apply(uid: uid, groups: groups, running: running) }
+            }
+        }
+    }
+
+    /// The output device and the audio processes, grouped by the regular app that owns them.
+    nonisolated private static func scan(_ ids: [String]) -> (String?, [String: (processes: [AudioObjectID], playing: Bool)]) {
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        let output = getValue(system, kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal, AudioDeviceID(0)) ?? 0
         var groups: [String: (processes: [AudioObjectID], playing: Bool)] = [:]
         for p in getArray(system, kAudioHardwarePropertyProcessObjectList, of: AudioObjectID.self) {
             guard let pid = getValue(p, kAudioProcessPropertyPID, kAudioObjectPropertyScopeGlobal, pid_t(0)), pid != getpid(),
@@ -253,6 +261,11 @@ final class AppVolumes: ObservableObject {
             groups[owner, default: ([], false)].processes.append(p)
             if playing { groups[owner]!.playing = true }
         }
+        return (stringProperty(output, kAudioDevicePropertyDeviceUID), groups)
+    }
+
+    private func apply(uid: String?, groups: [String: (processes: [AudioObjectID], playing: Bool)], running: [NSRunningApplication]) {
+        if uid != outputUID { outputUID = uid; taps.values.forEach { $0.release() }; taps.removeAll() }
         let list = groups.compactMap { id, g -> AudioApp? in
             guard g.playing || gains[id] != nil, let app = running.first(where: { $0.bundleIdentifier == id }) else { return nil }
             return AudioApp(id: id, name: app.localizedName ?? id, icon: app.icon, processes: g.processes.sorted(), playing: g.playing)
@@ -268,7 +281,7 @@ final class AppVolumes: ObservableObject {
             if g >= 0.995 || failed.contains(app.id) || s == .denied || s == .notAsked { taps.removeValue(forKey: app.id)?.release(); continue }
             if let tap = taps[app.id], tap.processes == app.processes { continue }
             taps.removeValue(forKey: app.id)?.release()
-            if #available(macOS 14.2, *), let uid {
+            if let uid {
                 taps[app.id] = AppTap(processes: app.processes, gain: g, outputUID: uid)
             }
         }
@@ -300,9 +313,7 @@ struct AppVolumeList: View {
     @Environment(\.tileSize) var size
 
     var body: some View {
-        if !AppVolumes.supported {
-            Text("Per-app volume needs macOS 14.2 or later.").font(.system(size: 11)).foregroundStyle(theme.secondary)
-        } else if vols.apps.isEmpty {
+        if vols.apps.isEmpty {
             Text("No app is playing sound.").font(.system(size: 11)).foregroundStyle(theme.secondary)
         } else {
             VStack(alignment: .leading, spacing: 4) {

@@ -67,14 +67,14 @@ final class IslandModel: ObservableObject {
     private var peekQueue: [(Peek, Date)] = []
     private var peekTimer: Timer?
 
-    static let spring = Animation.spring(response: 0.38, dampingFraction: 0.8)
+    static let spring = Animation.spring(response: 0.3, dampingFraction: 0.82)
 
-    // Hover: opens 0.25 s after the mouse rests on the notch, closes when it leaves.
+    // Hover: opens 0.15 s after the pointer reaches the notch area, closes when it leaves.
     func mouseInside(_ inside: Bool) {
         if inside {
             Awake.hold("hover", true)
             guard !hoverExpanded, hoverTimer == nil else { return } // don't restart a running countdown
-            let t = Timer(timeInterval: 0.25, repeats: false) { [weak self] _ in
+            let t = Timer(timeInterval: 0.15, repeats: false) { [weak self] _ in
                 MainActor.assumeIsolated {
                     self?.hoverTimer = nil
                     self?.hoverExpanded = true
@@ -321,9 +321,12 @@ final class IslandContainerView: NSView {
     /// target and real hovers often brush past it in under 0.25 s.
     var slack: CGFloat = 0 { didSet { if slack != oldValue { updateTrackingAreas(); checkMouse() } } }
 
+    /// Wide to the sides (the menu bar beside the notch is how the pointer usually arrives, so the countdown
+    /// starts on the way in), shallow below it (the browser tab bar sits right under the notch).
     var hoverRect: NSRect {
-        NSRect(x: (bounds.width - islandSize.width) / 2 - slack, y: bounds.height - islandSize.height - slack,
-               width: islandSize.width + 2 * slack, height: islandSize.height + slack + 2) // +2: the very top pixel row counts
+        let below = min(slack, 14)
+        return NSRect(x: (bounds.width - islandSize.width) / 2 - slack, y: bounds.height - islandSize.height - below,
+                      width: islandSize.width + 2 * slack, height: islandSize.height + below + 2) // +2: the very top pixel row counts
     }
 
     override func updateTrackingAreas() {
@@ -413,7 +416,7 @@ final class IslandController {
         }.store(in: &bag)
         model.$dragNear.sink { [weak self] on in self?.panel.acceptsDrops = on }.store(in: &bag)
         model.$state.sink { [weak self] s in
-            self?.container.slack = (s == .resting || s == .compact) ? 16 : 0
+            self?.container.slack = (s == .resting || s == .compact) ? 40 : 0
             self?.resize(for: s)
         }.store(in: &bag)
 

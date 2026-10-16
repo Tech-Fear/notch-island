@@ -59,6 +59,7 @@ func cli(_ args: [String]) -> Int32 {
     notch progress <0-100|done> [title] live progress in the notch pill
     notch run [--title T] -- cmd args…  run a command; shows it working, then Done/Failed with the time
     notch ask "question" [detail]       Yes/No in the island; exit 0 = yes, 1 = no, 2 = no answer
+    notch view <file>                   open a JSON / XML / CSV / Markdown file in the viewer under the notch
     """
     guard let first = args.first, !["help", "-h", "--help"].contains(first) else { print(usage); return 0 }
     let rest = Array(args.dropFirst())
@@ -95,6 +96,11 @@ func cli(_ args: [String]) -> Int32 {
         guard let value = rest.first, let fd = connectToApp() else { return 0 }
         send(fd, ["hook_event_name": "NotchCLI", "action": "progress", "value": value,
                   "title": rest.dropFirst().joined(separator: " ")])
+        close(fd)
+    case "view":
+        guard let file = rest.first, let fd = connectToApp() else { print(usage); return 64 }
+        let path = URL(fileURLWithPath: file, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)).path
+        send(fd, ["hook_event_name": "NotchCLI", "action": "view", "path": path])
         close(fd)
     case "done", "fail":
         guard let fd = connectToApp() else { return 0 }

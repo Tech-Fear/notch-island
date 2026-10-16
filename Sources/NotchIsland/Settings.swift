@@ -6,6 +6,7 @@ enum TileKind: String, CaseIterable, Identifiable, Codable {
     case music, weather, calendar, timer, volume, shelf, clipboard, controls, battery, reminders
     case stats, launcher, countdown, colorPicker, notes, actions, downloads
     case ports, git, docker
+    case authenticator, tools
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -29,6 +30,8 @@ enum TileKind: String, CaseIterable, Identifiable, Codable {
         case .ports: "Ports"
         case .git: "Git"
         case .docker: "Docker"
+        case .authenticator: "Authenticator"
+        case .tools: "Dev Toolbox"
         }
     }
     var symbol: String {
@@ -53,6 +56,34 @@ enum TileKind: String, CaseIterable, Identifiable, Codable {
         case .ports: "network"
         case .git: "arrow.triangle.branch"
         case .docker: "shippingbox"
+        case .authenticator: "key.fill"
+        case .tools: "wrench.and.screwdriver"
+        }
+    }
+}
+
+extension TileKind {
+    /// Menu-bar groups, by what the widgets are for.
+    enum Group: String, CaseIterable {
+        case media = "Media", today = "Today", files = "Files", system = "System", developer = "Developer"
+        var symbol: String {
+            switch self {
+            case .media: "music.note"
+            case .today: "calendar"
+            case .files: "tray"
+            case .system: "gearshape"
+            case .developer: "chevron.left.forwardslash.chevron.right"
+            }
+        }
+    }
+
+    var group: Group {
+        switch self {
+        case .music, .volume: .media
+        case .weather, .calendar, .reminders, .timer, .countdown, .notes: .today
+        case .shelf, .downloads, .clipboard: .files
+        case .controls, .battery, .stats, .actions, .launcher: .system
+        case .tools, .authenticator, .git, .ports, .docker, .colorPicker: .developer
         }
     }
 }
@@ -90,16 +121,66 @@ extension TileKind {
                       .init(id: "disk", title: "Disk free"), .init(id: "network", title: "Network speed")]
         case .actions: QuickAction.allCases.map { .init(id: $0.rawValue, title: $0.title) }
         case .downloads: [.init(id: "names", title: "File names")]
-        case .launcher, .countdown, .colorPicker, .notes, .ports, .git, .docker: []
+        case .launcher, .countdown, .colorPicker, .notes, .ports, .git, .docker, .authenticator, .tools: []
         }
     }
 }
 
-/// One widget on a carousel page. A widget may appear on several pages.
+/// One widget on a carousel page. A widget may appear several times, on one page or many.
 struct Placement: Codable, Hashable, Identifiable {
     var id = UUID()
     var kind: TileKind
-    var width: Int // units: a page's width is shared out by units
+    var width: Int // columns: a page's width is shared out by columns
+    var height = 1 // rows: widgets one row tall stack up next to taller ones
+
+    init(kind: TileKind, width: Int, height: Int = 1) { self.kind = kind; self.width = width; self.height = height }
+
+    // Layouts saved before rows existed have no height.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        kind = try c.decode(TileKind.self, forKey: .kind)
+        width = try c.decode(Int.self, forKey: .width)
+        height = try c.decodeIfPresent(Int.self, forKey: .height) ?? 1
+    }
+}
+
+/// Where each widget of a page sits: a grid as many rows tall as its tallest widget, with the fewest
+/// columns that hold everything. Widgets fill it in order, left to right, top to bottom, each in the
+/// first gap it fits (so two short widgets stack beside a tall one). One-row pages work as before.
+struct PageGrid {
+    var columns = 1, rows = 1
+    var cells: [UUID: (col: Int, row: Int)] = [:]
+
+    init(_ tiles: [Placement]) {
+        guard !tiles.isEmpty else { return }
+        rows = tiles.map(\.height).max()!
+        let area = tiles.reduce(0) { $0 + $1.width * $1.height }
+        var cols = max(tiles.map(\.width).max()!, (area + rows - 1) / rows)
+        while true { // ends by the time every widget fits in one row of columns
+            if let fit = Self.pack(tiles, columns: cols, rows: rows) { columns = cols; cells = fit; return }
+            cols += 1
+        }
+    }
+
+    private static func pack(_ tiles: [Placement], columns: Int, rows: Int) -> [UUID: (col: Int, row: Int)]? {
+        var used = Array(repeating: Array(repeating: false, count: columns), count: rows)
+        var out: [UUID: (col: Int, row: Int)] = [:]
+        func free(_ c: Int, _ r: Int, _ t: Placement) -> Bool {
+            (r..<r + t.height).allSatisfy { y in (c..<c + t.width).allSatisfy { !used[y][$0] } }
+        }
+        next: for t in tiles { // columns >= every width and rows >= every height, so the ranges are valid
+            for r in 0...(rows - t.height) {
+                for c in 0...(columns - t.width) where free(c, r, t) {
+                    for y in r..<r + t.height { for x in c..<c + t.width { used[y][x] = true } }
+                    out[t.id] = (c, r)
+                    continue next
+                }
+            }
+            return nil
+        }
+        return out
+    }
 }
 
 /// Everything the visual editor changes.
@@ -111,19 +192,33 @@ struct IslandLayout: Codable, Equatable {
     var spacing: Double = 10
 
     static let widthRange = 1...4
+    static let heightRange = 1...3
 
+    /// The default: one page per job, as tuned on the developer's Mac.
     static let standard = IslandLayout(pages: [
+        [.init(kind: .weather, width: 1), .init(kind: .calendar, width: 1), .init(kind: .timer, width: 1), .init(kind: .battery, width: 1)],
+        [.init(kind: .controls, width: 1), .init(kind: .shelf, width: 1)],
+        [.init(kind: .volume, width: 2), .init(kind: .music, width: 2)],
+        [.init(kind: .downloads, width: 1), .init(kind: .stats, width: 1)],
+        [.init(kind: .actions, width: 1), .init(kind: .ports, width: 1), .init(kind: .git, width: 1)],
+        [.init(kind: .tools, width: 1, height: 2), .init(kind: .authenticator, width: 1, height: 2)],
+    ], islandWidth: 677, tileHeight: 100)
+
+    /// The pages older versions added one by one (used only to upgrade layouts saved by them).
+    static let earlierPages = IslandLayout(pages: [
         [.init(kind: .music, width: 2), .init(kind: .weather, width: 1), .init(kind: .calendar, width: 1), .init(kind: .timer, width: 1)],
         [.init(kind: .music, width: 2), .init(kind: .volume, width: 1), .init(kind: .shelf, width: 1)],
         [.init(kind: .controls, width: 2), .init(kind: .battery, width: 1), .init(kind: .reminders, width: 1), .init(kind: .clipboard, width: 1)],
         [.init(kind: .stats, width: 1), .init(kind: .launcher, width: 2), .init(kind: .actions, width: 1)],
         [.init(kind: .notes, width: 1), .init(kind: .countdown, width: 1), .init(kind: .colorPicker, width: 1), .init(kind: .downloads, width: 1)],
         [.init(kind: .git, width: 1), .init(kind: .ports, width: 1), .init(kind: .docker, width: 1)],
+        [.init(kind: .authenticator, width: 2), .init(kind: .tools, width: 1)],
     ])
 
     static let newInV3: [TileKind] = [.clipboard, .controls, .battery, .reminders]
     static let newInV4: [TileKind] = [.stats, .launcher, .countdown, .colorPicker, .notes, .actions, .downloads]
     static let newInV5: [TileKind] = [.ports, .git, .docker]
+    static let newInV6: [TileKind] = [.authenticator, .tools]
 
     func contains(_ kind: TileKind) -> Bool { pages.contains { $0.contains { $0.kind == kind } } }
     func page(of kind: TileKind) -> Int? { pages.firstIndex { $0.contains { $0.kind == kind } } }
@@ -154,13 +249,16 @@ final class AppSettings: ObservableObject {
             var l = saved
             // Layouts saved before these widgets existed get them once, on a new page.
             if !d.bool(forKey: "layoutV3"), !IslandLayout.newInV3.contains(where: saved.contains) {
-                l.pages.append(IslandLayout.standard.pages[2])
+                l.pages.append(IslandLayout.earlierPages.pages[2])
             }
             if !d.bool(forKey: "layoutV4"), !IslandLayout.newInV4.contains(where: saved.contains) {
-                l.pages += IslandLayout.standard.pages[3...4]
+                l.pages += IslandLayout.earlierPages.pages[3...4]
             }
             if !d.bool(forKey: "layoutV5"), !IslandLayout.newInV5.contains(where: saved.contains) {
-                l.pages.append(IslandLayout.standard.pages[5])
+                l.pages.append(IslandLayout.earlierPages.pages[5])
+            }
+            if !d.bool(forKey: "layoutV6"), !IslandLayout.newInV6.contains(where: saved.contains) {
+                l.pages.append(IslandLayout.earlierPages.pages[6])
             }
             layout = l
         } else {
@@ -175,6 +273,7 @@ final class AppSettings: ObservableObject {
         d.set(true, forKey: "layoutV3")
         d.set(true, forKey: "layoutV4")
         d.set(true, forKey: "layoutV5")
+        d.set(true, forKey: "layoutV6")
         gitRepo = d.string(forKey: "gitRepo")
         screenshotsToShelf = d.bool(forKey: "screenshotsToShelf")
         countdown = d.data(forKey: "countdown").flatMap { try? JSONDecoder().decode(Countdown.self, from: $0) }

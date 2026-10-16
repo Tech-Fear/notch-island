@@ -342,22 +342,27 @@ struct ExpandedView: View {
 
     @ViewBuilder private func page(_ tiles: [Placement], layout: IslandLayout) -> some View {
         let spacing = CGFloat(layout.spacing)
-        let units = CGFloat(max(tiles.reduce(0) { $0 + $1.width }, 1))
-        let unit = (width - 2 * pad - spacing * CGFloat(max(tiles.count - 1, 0))) / units
+        let grid = PageGrid(tiles)
+        let colW = (width - 2 * pad - spacing * CGFloat(grid.columns - 1)) / CGFloat(grid.columns)
+        let rowH = CGFloat(layout.tileHeight)
         if tiles.isEmpty {
             Text("This page is empty.").font(.system(size: 12)).foregroundStyle(theme.secondary)
                 .frame(maxWidth: .infinity, minHeight: CGFloat(layout.tileHeight))
         } else {
-            HStack(spacing: spacing) {
+            ZStack(alignment: .topLeading) {
                 ForEach(tiles) { t in
-                    let size = CGSize(width: unit * CGFloat(t.width), height: CGFloat(layout.tileHeight))
+                    let cell = grid.cells[t.id] ?? (0, 0)
+                    let size = CGSize(width: colW * CGFloat(t.width) + spacing * CGFloat(t.width - 1),
+                                      height: rowH * CGFloat(t.height) + spacing * CGFloat(t.height - 1))
                     Self.tile(t.kind)
                         .environment(\.tileSize, size)
                         .frame(width: size.width, height: size.height, alignment: .top) // overflow goes down, never hides the header
                         .background(theme.tile, in: RoundedRectangle(cornerRadius: CGFloat(layout.corner)))
                         .clipShape(RoundedRectangle(cornerRadius: CGFloat(layout.corner)))
+                        .offset(x: CGFloat(cell.col) * (colW + spacing), y: CGFloat(cell.row) * (rowH + spacing))
                 }
             }
+            .frame(width: width - 2 * pad, height: rowH * CGFloat(grid.rows) + spacing * CGFloat(grid.rows - 1), alignment: .topLeading)
         }
     }
 
@@ -383,6 +388,8 @@ struct ExpandedView: View {
         case .ports: PortsTile()
         case .git: GitTile()
         case .docker: DockerTile()
+        case .authenticator: AuthenticatorTile()
+        case .tools: ToolsTile()
         }
     }
 }

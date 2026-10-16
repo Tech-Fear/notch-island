@@ -41,13 +41,14 @@ struct LayoutEditorView: View {
                 .padding(6)
             }
 
-            Text("Drag widgets to reorder them or move them to another page. Click a page title to show it in the island.")
+            Text("Drag widgets to reorder them or move them to another page. W sets how many columns a widget spans, H how many rows: make one widget taller and shorter ones stack beside it. Add the same widget as often as you like. Click a page title to show it in the island.")
                 .font(.caption).foregroundStyle(.secondary)
 
             ScrollView {
                 VStack(spacing: 12) {
                     ForEach(settings.layout.pages.indices, id: \.self) { i in pageRow(i) }
                 }
+                .padding(.trailing, 16) // room for the scroll bar, so it never covers the trash buttons
             }
 
             HStack {
@@ -55,28 +56,38 @@ struct LayoutEditorView: View {
                     Label("Add Page", systemImage: "plus")
                 }
                 Spacer()
-                Button("Reset to Default") { settings.layout = .standard; model.showPage(0) }
+                Button("Reset to Default…") { confirmReset() }
                 // A menu-bar app has no main menu, so ⌘W and Esc need their own button.
                 Button("Done") { NSApp.keyWindow?.close() }
                     .keyboardShortcut("w", modifiers: .command)
+                    .buttonStyle(.borderedProminent)
                 Button("") { NSApp.keyWindow?.close() }.keyboardShortcut(.cancelAction).hidden()
             }
         }
         .padding(16)
-        .frame(width: 620, height: 600)
+        .frame(width: 720, height: 640)
     }
 
     private func slider(_ title: String, _ value: Binding<Double>, _ range: ClosedRange<Double>) -> some View {
         HStack {
             Text(title).frame(width: 110, alignment: .leading)
-            Slider(value: value, in: range, step: 1)
+            // Whole numbers without step ticks (a step of 1 draws a tick per value).
+            Slider(value: Binding(get: { value.wrappedValue }, set: { value.wrappedValue = $0.rounded() }), in: range)
             Text("\(Int(value.wrappedValue))").monospacedDigit().frame(width: 40, alignment: .trailing)
         }
     }
 
+    private func confirmReset() {
+        let alert = NSAlert()
+        alert.messageText = "Reset the layout to the default?"
+        alert.informativeText = "Your pages, widgets and sizes are replaced by the default layout."
+        alert.addButton(withTitle: "Reset")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn { settings.layout = .standard; model.showPage(0) }
+    }
+
     private func pageRow(_ i: Int) -> some View {
         let tiles = settings.layout.pages[i]
-        let units = CGFloat(max(tiles.reduce(0) { $0 + $1.width }, 1))
         let current = model.page == i
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
@@ -92,8 +103,8 @@ struct LayoutEditorView: View {
                             Label(k.title, systemImage: k.symbol)
                         }
                     }
-                } label: { Label("Add Widget", systemImage: "plus.square") }
-                .fixedSize()
+                } label: { Label("Add Widget", systemImage: "plus") }
+                .menuStyle(.borderlessButton).fixedSize()
                 Button(role: .destructive) {
                     settings.layout.pages.remove(at: i)
                     model.showPage(min(model.page, settings.layout.pages.count - 1))
@@ -102,14 +113,22 @@ struct LayoutEditorView: View {
                 .disabled(settings.layout.pages.count == 1)
                 .help("Delete this page")
             }
+            // The same grid as the island: widths share out the columns, heights stack rows.
+            let grid = PageGrid(tiles)
+            let spacing: CGFloat = 6, rowH: CGFloat = 66
             GeometryReader { g in
-                let spacing: CGFloat = 6
-                let unit = (g.size.width - spacing * CGFloat(max(tiles.count - 1, 0))) / units
-                HStack(spacing: spacing) {
-                    ForEach(tiles) { t in chip(t, page: i).frame(width: unit * CGFloat(t.width)) }
+                let colW = (g.size.width - spacing * CGFloat(grid.columns - 1)) / CGFloat(grid.columns)
+                ZStack(alignment: .topLeading) {
+                    ForEach(tiles) { t in
+                        let cell = grid.cells[t.id] ?? (0, 0)
+                        chip(t, page: i)
+                            .frame(width: colW * CGFloat(t.width) + spacing * CGFloat(t.width - 1),
+                                   height: rowH * CGFloat(t.height) + spacing * CGFloat(t.height - 1))
+                            .offset(x: CGFloat(cell.col) * (colW + spacing), y: CGFloat(cell.row) * (rowH + spacing))
+                    }
                 }
             }
-            .frame(height: 64)
+            .frame(height: rowH * CGFloat(grid.rows) + spacing * CGFloat(grid.rows - 1))
             .padding(6)
             .background(RoundedRectangle(cornerRadius: 10).strokeBorder(current ? Color.accentColor : Color.secondary.opacity(0.3),
                                                                         style: StrokeStyle(lineWidth: 1, dash: tiles.isEmpty ? [4] : [])))
@@ -123,11 +142,10 @@ struct LayoutEditorView: View {
 
     private func chip(_ t: Placement, page: Int) -> some View {
         VStack(spacing: 4) {
-            Label(t.kind.title, systemImage: t.kind.symbol)
-                .font(.system(size: 11, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.75)
-                .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 4) {
-                Spacer(minLength: 0)
+                Label(t.kind.title, systemImage: t.kind.symbol)
+                    .font(.system(size: 11, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.75)
+                Spacer(minLength: 2)
                 Button { editor.optionsFor = t.id } label: { Image(systemName: "gearshape") }
                     .buttonStyle(.borderless).help("Options")
                     .popover(isPresented: Binding(get: { editor.optionsFor == t.id },
@@ -136,14 +154,22 @@ struct LayoutEditorView: View {
                     .buttonStyle(.borderless).help("Remove")
             }
             .font(.system(size: 11, weight: .medium))
-            HStack(spacing: 6) {
-                Button { resize(t, page: page, by: -1) } label: { Image(systemName: "minus") }
+            Spacer(minLength: 0)
+            HStack(spacing: 4) {
+                Button { resize(t, page: page, \.width, by: -1, IslandLayout.widthRange) } label: { Image(systemName: "minus") }
                     .disabled(t.width <= IslandLayout.widthRange.lowerBound)
-                Text("width \(t.width)").font(.system(size: 10).monospacedDigit()).foregroundStyle(.secondary)
-                Button { resize(t, page: page, by: 1) } label: { Image(systemName: "plus") }
+                Text("W \(t.width)").font(.system(size: 10).monospacedDigit()).foregroundStyle(.secondary)
+                Button { resize(t, page: page, \.width, by: 1, IslandLayout.widthRange) } label: { Image(systemName: "plus") }
                     .disabled(t.width >= IslandLayout.widthRange.upperBound)
+                Spacer(minLength: 2)
+                Button { resize(t, page: page, \.height, by: -1, IslandLayout.heightRange) } label: { Image(systemName: "minus") }
+                    .disabled(t.height <= IslandLayout.heightRange.lowerBound)
+                Text("H \(t.height)").font(.system(size: 10).monospacedDigit()).foregroundStyle(.secondary)
+                Button { resize(t, page: page, \.height, by: 1, IslandLayout.heightRange) } label: { Image(systemName: "plus") }
+                    .disabled(t.height >= IslandLayout.heightRange.upperBound)
             }
             .buttonStyle(.borderless)
+            .help("W: columns wide · H: rows tall (shorter widgets stack beside taller ones)")
         }
         .padding(8)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -174,10 +200,10 @@ struct LayoutEditorView: View {
         .frame(width: 260)
     }
 
-    private func resize(_ t: Placement, page: Int, by delta: Int) {
+    private func resize(_ t: Placement, page: Int, _ side: WritableKeyPath<Placement, Int>, by delta: Int, _ range: ClosedRange<Int>) {
         guard let j = settings.layout.pages[page].firstIndex(where: { $0.id == t.id }) else { return }
-        let w = settings.layout.pages[page][j].width + delta
-        if IslandLayout.widthRange.contains(w) { settings.layout.pages[page][j].width = w }
+        let v = settings.layout.pages[page][j][keyPath: side] + delta
+        if range.contains(v) { settings.layout.pages[page][j][keyPath: side] = v }
     }
 }
 

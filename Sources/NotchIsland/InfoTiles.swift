@@ -166,11 +166,20 @@ final class CalendarService: ObservableObject {
         refresh()
     }
 
+    private var refreshing = false
+
+    /// A week of a big work calendar can take seconds to read: done off the main thread.
     func refresh() {
-        let now = Date()
-        let pred = store.predicateForEvents(withStart: now, end: now.addingTimeInterval(7 * 86_400), calendars: nil)
-        let events = store.events(matching: pred).filter { $0.endDate > now }.sorted { $0.startDate < $1.startDate }
-        next = events.first(where: { !$0.isAllDay }) ?? events.first
+        guard !refreshing else { return }
+        refreshing = true
+        let store = store
+        DispatchQueue.global(qos: .utility).async {
+            let now = Date()
+            let pred = store.predicateForEvents(withStart: now, end: now.addingTimeInterval(7 * 86_400), calendars: nil)
+            let events = store.events(matching: pred).filter { $0.endDate > now }.sorted { $0.startDate < $1.startDate }
+            let next = events.first(where: { !$0.isAllDay }) ?? events.first
+            DispatchQueue.main.async { MainActor.assumeIsolated { self.refreshing = false; self.next = next } }
+        }
     }
 }
 
