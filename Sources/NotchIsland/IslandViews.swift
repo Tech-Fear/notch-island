@@ -30,6 +30,12 @@ struct NotchShape: Shape {
 struct IslandRootView: View {
     @ObservedObject var model = IslandModel.shared
     @ObservedObject var settings = AppSettings.shared
+    /// This island's screen (each screen's island has its own notch size).
+    @ObservedObject var place: IslandPlace
+    var onSize: (CGSize) -> Void = { _ in }
+
+    /// The shared state, except that only the active screen's island opens.
+    private var state: IslandState { model.state(on: place.screen) }
 
     var body: some View {
         island
@@ -37,7 +43,7 @@ struct IslandRootView: View {
     }
 
     private var bottomRadius: CGFloat {
-        switch model.state {
+        switch state {
         case .resting: 9
         case .compact: 12
         case .peek: 20
@@ -48,43 +54,43 @@ struct IslandRootView: View {
     private var island: some View {
         let theme = settings.themeColors
         let shape = NotchShape(ear: NotchGeometry.ear, bottom: bottomRadius)
-        let open = model.state == .peek || model.state == .expanded
+        let open = state == .peek || state == .expanded
         return content
-            .frame(width: model.width(for: model.state), alignment: .top)
+            .frame(width: model.width(for: state, on: place.notch), alignment: .top)
             .background(alignment: .top) {
                 ZStack(alignment: .top) {
                     theme.background
-                    Color.black.frame(height: model.notch.height) // the real notch band stays black
+                    Color.black.frame(height: place.notch.height) // the real notch band stays black
                 }
             }
             .clipShape(shape)
             .contentShape(shape)
-            .onGeometryChange(for: CGSize.self, of: { $0.size }, action: { model.islandSize = $0 })
+            .onGeometryChange(for: CGSize.self, of: { $0.size }, action: { onSize($0) })
             .compositingGroup()
             .shadow(color: .black.opacity(open ? 0.28 : 0), radius: 14, y: 6)
             .environment(\.theme, theme)
-            .animation(IslandModel.spring, value: model.state)
+            .animation(IslandModel.spring, value: state)
             .animation(IslandModel.spring, value: settings.theme)
     }
 
     @ViewBuilder private var content: some View {
-        switch model.state {
+        switch state {
         case .resting:
-            Color.clear.frame(height: model.notch.height)
+            Color.clear.frame(height: place.notch.height)
         case .compact:
             CompactView(side: model.compactSide)
-                .frame(height: model.notch.height)
+                .frame(height: place.notch.height)
                 .padding(.horizontal, NotchGeometry.ear)
                 .transition(.opacity)
         case .peek:
             VStack(spacing: 0) {
-                Color.clear.frame(height: model.notch.height)
+                Color.clear.frame(height: place.notch.height)
                 if let peek = model.peek { PeekView(peek: peek) }
             }
             .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .top)))
         case .expanded:
             VStack(spacing: 0) {
-                Color.clear.frame(height: model.notch.height)
+                Color.clear.frame(height: place.notch.height)
                 ExpandedView(width: model.width(for: .expanded) - 2 * NotchGeometry.ear)
                     .padding(.horizontal, NotchGeometry.ear)
             }

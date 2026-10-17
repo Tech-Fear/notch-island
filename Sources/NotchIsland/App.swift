@@ -5,7 +5,7 @@ import ServiceManagement
 @main
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
-    private var island: IslandController!
+    private var island: IslandManager!
     private var bag = Set<AnyCancellable>()
 
     static func main() {
@@ -50,7 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
 
-        island = IslandController()
+        island = IslandManager()
         Hotkeys.shared.checkAvailability()
         ClaudeBridge.shared.start()
         PeekCenter.shared.start()
@@ -129,6 +129,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         menu.addItem(submenu("Theme", symbol: "paintpalette", ThemeName.allCases.map { t in item(t.title, on: s.theme == t) { s.theme = t } }))
+        // With more than one display: where the island goes.
+        var screenItems = IslandScreens.allCases.map { m in item(m.title, on: s.islandScreens == m) { s.islandScreens = m } }
+        if s.islandScreens == .chosen {
+            screenItems.append(.separator())
+            screenItems.append(item("Automatic (notch screen, else main)", on: s.islandScreenName == nil) { s.islandScreenName = nil })
+            for name in NSScreen.screens.map(\.localizedName) {
+                screenItems.append(item(name, on: s.islandScreenName == name) { s.islandScreenName = name })
+            }
+        }
+        menu.addItem(submenu("Screens", symbol: "display.2", screenItems))
         let peeks = PeekCenter.shared
         var peekItems = [item("Focus / Do Not Disturb", on: s.focusPeeks) { peeks.setFocusPeeks(!s.focusPeeks) }]
         if s.focusPeeks, let note = peeks.focusNote { peekItems.append(info("   " + note)) }

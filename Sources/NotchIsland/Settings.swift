@@ -224,6 +224,26 @@ struct IslandLayout: Codable, Equatable {
     func page(of kind: TileKind) -> Int? { pages.firstIndex { $0.contains { $0.kind == kind } } }
 }
 
+/// Where the island appears when there's more than one display.
+enum IslandScreens: String, CaseIterable, Identifiable {
+    case followMouse, all, chosen
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .followMouse: "Follows the Mouse"
+        case .all: "On Every Screen"
+        case .chosen: "One Screen I Choose"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .followMouse: "One island, on whichever screen your pointer is on."
+        case .all: "An island on each screen with the same status; a question shows on all, answering on one clears it everywhere."
+        case .chosen: "Always on the screen you pick below."
+        }
+    }
+}
+
 /// All user settings, stored in UserDefaults. Nothing is synced anywhere.
 @MainActor
 final class AppSettings: ObservableObject {
@@ -242,6 +262,9 @@ final class AppSettings: ObservableObject {
     /// New screenshots are added to the Shelf (opt-in: reading their folder asks for access once).
     @Published var screenshotsToShelf: Bool { didSet { d.set(screenshotsToShelf, forKey: "screenshotsToShelf") } }
     @Published var countdown: Countdown? { didSet { d.set(try? JSONEncoder().encode(countdown), forKey: "countdown") } }
+    @Published var islandScreens: IslandScreens { didSet { d.set(islandScreens.rawValue, forKey: "islandScreens") } }
+    /// The display picked for `.chosen` (its name); nil: the screen with the notch, else the main screen.
+    @Published var islandScreenName: String? { didSet { d.set(islandScreenName, forKey: "islandScreenName") } }
 
     private init() {
         theme = ThemeName(rawValue: d.string(forKey: "theme") ?? "") ?? .darkMatte
@@ -274,6 +297,8 @@ final class AppSettings: ObservableObject {
         d.set(true, forKey: "layoutV4")
         d.set(true, forKey: "layoutV5")
         d.set(true, forKey: "layoutV6")
+        islandScreens = IslandScreens(rawValue: d.string(forKey: "islandScreens") ?? "") ?? .followMouse
+        islandScreenName = d.string(forKey: "islandScreenName")
         gitRepo = d.string(forKey: "gitRepo")
         screenshotsToShelf = d.bool(forKey: "screenshotsToShelf")
         countdown = d.data(forKey: "countdown").flatMap { try? JSONDecoder().decode(Countdown.self, from: $0) }
@@ -355,6 +380,18 @@ struct SettingsView: View {
             }
             Section("Layout") {
                 Button("Edit Layout…") { LayoutEditorController.shared.show() }
+            }
+            Section("Screens") {
+                Picker("Island", selection: $settings.islandScreens) {
+                    ForEach(IslandScreens.allCases) { Text($0.title).tag($0) }
+                }
+                Text(settings.islandScreens.detail).font(.caption).foregroundStyle(.secondary)
+                if settings.islandScreens == .chosen {
+                    Picker("Screen", selection: $settings.islandScreenName) {
+                        Text("Automatic (the notch screen, else the main one)").tag(String?.none)
+                        ForEach(NSScreen.screens.map(\.localizedName), id: \.self) { Text($0).tag(String?.some($0)) }
+                    }
+                }
             }
             Section("Appearance") {
                 Picker("Theme", selection: $settings.theme) {

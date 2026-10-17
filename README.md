@@ -23,6 +23,12 @@
 It lives in the menu bar, has no Dock icon, and only starts at login if you turn that on.
 On Macs without a notch it draws one at the top centre of the screen.
 
+**More than one display?** Choose in the menu bar (**Screens**) or in Settings:
+- **Follows the Mouse** (default): one island, which moves to whichever screen your pointer is on (while it's closed).
+- **On Every Screen**: an island on each display, all showing the same status. Only the one you hover opens;
+  a Claude Code question shows on all of them, and answering on one clears it everywhere.
+- **One Screen I Choose**: always on the display you pick (automatic: the notch screen, else the main one).
+
 **Privacy:** only two kinds of request ever leave your Mac, lyrics ([LRCLIB](https://lrclib.net)) and
 weather ([Open-Meteo](https://open-meteo.com)). No analytics, no accounts.
 

@@ -527,4 +527,14 @@ import Testing
         let rsa = try generateSecrets(.rsa, size: 2048)
         #expect(rsa[0].value.hasPrefix("-----BEGIN RSA PRIVATE KEY-----") && rsa[1].value.hasSuffix("-----END RSA PUBLIC KEY-----"))
     }
+
+    @MainActor @Test func onlyTheActiveScreensIslandOpens() {
+        let m = IslandModel.shared
+        let before = m.activeScreen
+        m.activeScreen = 1
+        #expect(m.state(on: 1, .expanded) == .expanded)
+        #expect([.resting, .compact].contains(m.state(on: 2, .expanded))) // the other screen keeps its status
+        #expect(m.state(on: 2, .peek) == .peek && m.state(on: 2, .compact) == .compact) // bubbles show everywhere
+        m.activeScreen = before
+    }
 }

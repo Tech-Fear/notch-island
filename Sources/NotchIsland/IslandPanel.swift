@@ -9,24 +9,39 @@ struct NotchGeometry: Equatable {
     var width: CGFloat      // width of the hardware notch (or the fake one)
     var height: CGFloat     // height of the notch / menu bar band
     var hasNotch: Bool
+    var screenID: CGDirectDisplayID = 0
 
     static let ear: CGFloat = 6 // outward curve where the island meets the menu bar
 
-    /// Uses the screen with a notch; on Macs without one, draws a fake notch at the top centre of the main screen.
-    static func detect() -> NotchGeometry {
-        for s in NSScreen.screens where s.safeAreaInsets.top > 0 {
-            if let l = s.auxiliaryTopLeftArea, let r = s.auxiliaryTopRightArea {
-                return NotchGeometry(screenFrame: s.frame,
-                                     width: s.frame.width - l.width - r.width,
-                                     height: s.safeAreaInsets.top,
-                                     hasNotch: true)
-            }
+    /// One screen's notch; screens without one get a drawn notch at the top centre.
+    static func of(_ s: NSScreen) -> NotchGeometry {
+        if s.safeAreaInsets.top > 0, let l = s.auxiliaryTopLeftArea, let r = s.auxiliaryTopRightArea {
+            return NotchGeometry(screenFrame: s.frame, width: s.frame.width - l.width - r.width,
+                                 height: s.safeAreaInsets.top, hasNotch: true, screenID: s.displayID)
         }
-        let s = NSScreen.main ?? NSScreen.screens[0]
         let menuBar = s.frame.maxY - s.visibleFrame.maxY
-        return NotchGeometry(screenFrame: s.frame, width: 190,
-                             height: menuBar > 0 ? menuBar : 24, hasNotch: false)
+        return NotchGeometry(screenFrame: s.frame, width: 190, height: menuBar > 0 ? menuBar : 24, hasNotch: false, screenID: s.displayID)
     }
+
+    /// The screen with the notch, else the main screen.
+    static var defaultScreen: NSScreen {
+        NSScreen.screens.first { $0.safeAreaInsets.top > 0 && $0.auxiliaryTopLeftArea != nil } ?? NSScreen.main ?? NSScreen.screens[0]
+    }
+
+    static func detect() -> NotchGeometry { of(defaultScreen) }
+}
+
+extension NSScreen {
+    var displayID: CGDirectDisplayID { deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID ?? 0 }
+    static func under(_ p: NSPoint) -> NSScreen? { screens.first { NSMouseInRect(p, $0.frame, false) } }
+}
+
+/// Which screen one island is on (it moves when it follows the mouse).
+@MainActor
+final class IslandPlace: ObservableObject {
+    @Published var notch: NotchGeometry
+    init(_ notch: NotchGeometry) { self.notch = notch }
+    var screen: CGDirectDisplayID { notch.screenID }
 }
 
 // MARK: - Island state
@@ -52,6 +67,11 @@ final class IslandModel: ObservableObject {
     @Published private(set) var peek: Peek?
     @Published var notch = NotchGeometry.detect()
     @Published var islandSize: CGSize = .zero
+    /// The screen whose island opens (hovered or used last). With an island on every screen, the others keep
+    /// showing the status (resting / compact), except while Claude asks: a question opens on all of them.
+    @Published var activeScreen: CGDirectDisplayID = 0
+    @Published private(set) var askingEverywhere = false
+    private var hoveredScreens: Set<CGDirectDisplayID> = []
     /// Carousel page shown when the island is open.
     @Published var page = 0
     /// Development preview (snapshot command): these widgets at this height, instead of the carousel.
@@ -99,7 +119,25 @@ final class IslandModel: ObservableObject {
         hoverTimer = nil
     }
 
-    // A click opens it right away (no 0.25 s wait). It still closes as soon as the pointer leaves.
+    /// Hover from one island: the island counts as hovered while the pointer is on any of them.
+    func mouseInside(_ inside: Bool, screen: CGDirectDisplayID) {
+        if inside {
+            hoveredScreens.insert(screen)
+            if activeScreen != screen { activeScreen = screen }
+        } else {
+            hoveredScreens.remove(screen)
+        }
+        mouseInside(!hoveredScreens.isEmpty)
+    }
+
+    /// What the island on `screen` shows: the shared state, but only the active screen's island opens.
+    func state(on screen: CGDirectDisplayID, _ s: IslandState? = nil) -> IslandState {
+        let s = s ?? state
+        guard s == .expanded, screen != activeScreen, !askingEverywhere else { return s }
+        return activity != nil ? .compact : .resting
+    }
+
+    // A click opens it right away (no wait). It still closes as soon as the pointer leaves.
     func clickedInside() {
         cancelHoverTimer()
         hoverExpanded = true
@@ -185,6 +223,7 @@ final class IslandModel: ObservableObject {
     /// Called whenever anything that affects the island changes.
     func recompute() {
         let claude = ClaudeBridge.shared
+        if askingEverywhere != !claude.pending.isEmpty { askingEverywhere = !claude.pending.isEmpty }
         if claude.working { activity = .claude }
         else if !TaskCenter.shared.items.isEmpty { activity = .task }
         else if FocusTimer.shared.running { activity = .timer }
@@ -215,23 +254,25 @@ final class IslandModel: ObservableObject {
     // Island widths per state (heights come from the content).
     var compactSide: CGFloat { 58 }
     var restingWidth: CGFloat { notch.width + 2 * NotchGeometry.ear }
-    func width(for s: IslandState) -> CGFloat {
+    /// `on`: the screen's notch (each screen's island has its own); the active one by default.
+    func width(for s: IslandState, on n: NotchGeometry? = nil) -> CGFloat {
+        let resting = (n ?? notch).width + 2 * NotchGeometry.ear
         switch s {
-        case .resting: restingWidth
-        case .compact: restingWidth + 2 * compactSide
-        case .peek: max(restingWidth + 2 * compactSide, 360)
-        case .expanded: AppSettings.shared.layout.islandWidth
+        case .resting: return resting
+        case .compact: return resting + 2 * compactSide
+        case .peek: return max(resting + 2 * compactSide, 360)
+        case .expanded: return AppSettings.shared.layout.islandWidth
         }
     }
 
     /// The panel is sized to hold the largest island of the current state, plus room for the shadow.
-    func panelSize(for s: IslandState) -> CGSize {
-        let margin: CGFloat = 40
+    func panelSize(for s: IslandState, on n: NotchGeometry? = nil) -> CGSize {
+        let g = n ?? notch, margin: CGFloat = 40
         switch s {
-        case .resting, .compact: return CGSize(width: width(for: .compact) + margin, height: notch.height + margin)
-        case .peek: return CGSize(width: width(for: .peek) + margin, height: notch.height + 120)
-        case .expanded: return CGSize(width: width(for: .expanded) + margin,
-                                      height: min(notch.screenFrame.height * 0.8, 640))
+        case .resting, .compact: return CGSize(width: width(for: .compact, on: g) + margin, height: g.height + margin)
+        case .peek: return CGSize(width: width(for: .peek, on: g) + margin, height: g.height + 120)
+        case .expanded: return CGSize(width: width(for: .expanded, on: g) + margin,
+                                      height: min(g.screenFrame.height * 0.8, 640))
         }
     }
 }
@@ -376,6 +417,7 @@ final class IslandContainerView: NSView {
     }
 }
 
+/// One island window. `target` says which screen it belongs on (asked again at every move).
 @MainActor
 final class IslandController {
     private let panel = IslandPanel()
@@ -384,12 +426,24 @@ final class IslandController {
     private var bag = Set<AnyCancellable>()
     private var shrinkWork: DispatchWorkItem?
     private var monitors: [Any] = []
+    private var positionTimer: Timer?
+    private let target: () -> NSScreen
+    let place: IslandPlace
+    private var islandSize: CGSize = .zero
 
-    init() {
-        let host = FirstMouseHostingView(rootView: IslandRootView())
+    /// The state this island shows (only the active screen's island opens).
+    private var shown: IslandState { model.state(on: place.screen) }
+
+    init(target: @escaping () -> NSScreen) {
+        self.target = target
+        place = IslandPlace(NotchGeometry.of(target()))
+        let host = FirstMouseHostingView(rootView: IslandRootView(place: place, onSize: { [weak self] in self?.sized($0) }))
         host.autoresizingMask = [.width, .height]
         container.addSubview(host)
-        container.onHover = { [weak self] inside in self?.model.mouseInside(inside) }
+        container.onHover = { [weak self] inside in
+            guard let self else { return }
+            self.model.mouseInside(inside, screen: self.place.screen)
+        }
         container.registerForDraggedTypes(IslandContainerView.dropTypes)
         container.onDropHover = { [weak self] on in self?.model.setDropTargeted(on) }
         container.onDropped = { dropped in
@@ -410,15 +464,16 @@ final class IslandController {
         }
         panel.contentView = container
 
-        model.$islandSize.sink { [weak self] size in
-            self?.container.islandSize = size
-            self?.fitExpanded(to: size)
-        }.store(in: &bag)
         model.$dragNear.sink { [weak self] on in self?.panel.acceptsDrops = on }.store(in: &bag)
+        // In step with the change (not a tick later), so the opening animation is never clipped.
         model.$state.sink { [weak self] s in
-            self?.container.slack = (s == .resting || s == .compact) ? 40 : 0
-            self?.resize(for: s)
+            guard let self else { return }
+            self.apply(self.model.state(on: self.place.screen, s))
         }.store(in: &bag)
+        // Another screen's island opened, or a question for every island: re-check once the change is in.
+        model.$activeScreen.map { _ in () }.merge(with: model.$askingEverywhere.map { _ in () })
+            .sink { [weak self] in DispatchQueue.main.async { if let self { self.apply(self.shown) } } }
+            .store(in: &bag)
 
         NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
             .sink { [weak self] _ in
@@ -433,7 +488,10 @@ final class IslandController {
         if let m = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown, handler: { [weak self] e in
             if e.window === self?.panel, let self {
                 let p = self.container.convert(e.locationInWindow, from: nil)
-                if self.container.hoverRect.contains(p) { self.model.clickedInside() }
+                if self.container.hoverRect.contains(p) {
+                    self.model.activeScreen = self.place.screen
+                    self.model.clickedInside()
+                }
             }
             return e
         }) { monitors.append(m) }
@@ -453,23 +511,49 @@ final class IslandController {
         AppSettings.shared.$layout.dropFirst().sink { [weak self] layout in
             guard let self else { return }
             if self.model.page >= layout.pages.count { self.model.showPage(layout.pages.count - 1) }
-            if self.model.state == .expanded { self.resize(for: .expanded, immediately: true) }
+            if self.shown == .expanded { self.resize(for: .expanded, immediately: true) }
         }.store(in: &bag)
 
         // Display changes (lid closed with a monitor, a monitor unplugged during sleep) don't always
         // notify, and the island once stayed off-screen. Re-check its position every few seconds.
-        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+        positionTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                let target = self.frame(for: self.model.state)
+                let target = self.frame(for: self.shown)
                 if abs(self.panel.frame.midX - target.midX) > 1 || abs(self.panel.frame.maxY - target.maxY) > 1 {
-                    self.resize(for: self.model.state, immediately: true)
+                    self.resize(for: self.shown, immediately: true)
                 }
             }
         }
 
-        resize(for: model.state, immediately: true)
+        apply(shown, immediately: true)
         panel.orderFrontRegardless()
+    }
+
+    private func apply(_ s: IslandState, immediately: Bool = false) {
+        container.slack = (s == .resting || s == .compact) ? 40 : 0
+        resize(for: s, immediately: immediately)
+    }
+
+    /// Moves the island to `target`'s screen now (the screen changed).
+    func relocate() { resize(for: shown, immediately: true) }
+
+    /// Takes the island down (the screen setting changed or its display is gone).
+    func close() {
+        monitors.forEach(NSEvent.removeMonitor)
+        monitors = []
+        bag.removeAll()
+        positionTimer?.invalidate()
+        shrinkWork?.cancel()
+        fitWork?.cancel()
+        panel.orderOut(nil)
+    }
+
+    private func sized(_ size: CGSize) {
+        islandSize = size
+        container.islandSize = size
+        if place.screen == model.activeScreen { model.islandSize = size } // the editor and viewer place themselves by it
+        fitExpanded(to: size)
     }
 
     private var dragCount = NSPasteboard(name: .drag).changeCount
@@ -482,10 +566,13 @@ final class IslandController {
             let pb = NSPasteboard(name: .drag)
             guard pb.changeCount != dragCount,
                   pb.types?.contains(where: IslandContainerView.dropTypes.contains) == true else { return }
-            let p = NSEvent.mouseLocation, screen = model.notch.screenFrame
+            let p = NSEvent.mouseLocation, screen = place.notch.screenFrame
             // Generous zone: top 180 pt of the screen, 760 pt wide around the notch.
             let near = p.y > screen.maxY - 180 && abs(p.x - screen.midX) < 380
-            if near { model.setDragNear(true) }
+            if near {
+                if model.activeScreen != place.screen { model.activeScreen = place.screen } // the drop zone opens here
+                model.setDragNear(true)
+            }
             else if model.dragNear, !panel.frame.contains(p) { model.setDragNear(false) }
         default: // mouse up: the drop (if any) has been handled by then
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in self?.model.setDragNear(false) }
@@ -496,7 +583,7 @@ final class IslandController {
     private var swiped = false
 
     private func swipe(_ e: NSEvent) {
-        guard e.window === panel, model.state == .expanded, ClaudeBridge.shared.pending.isEmpty else { return }
+        guard e.window === panel, shown == .expanded, ClaudeBridge.shared.pending.isEmpty else { return }
         // A trackpad gesture starts with .began; a mouse wheel sends phase-less events, each its own "gesture".
         if e.phase == .began || (e.phase.isEmpty && e.momentumPhase.isEmpty) { swipeX = 0; swiped = false }
         guard abs(e.scrollingDeltaX) > abs(e.scrollingDeltaY) else { return }
@@ -509,10 +596,11 @@ final class IslandController {
 
     private func frame(for s: IslandState) -> NSRect {
         // Screens can be half-updated right after a display change: re-check every time.
-        let notch = NotchGeometry.detect()
-        if notch != model.notch { model.notch = notch }
-        let size = model.panelSize(for: s)
-        let screen = model.notch.screenFrame
+        let notch = NotchGeometry.of(target())
+        if notch != place.notch { place.notch = notch }
+        if place.screen == model.activeScreen, notch != model.notch { model.notch = notch }
+        let size = model.panelSize(for: s, on: notch)
+        let screen = notch.screenFrame
         return NSRect(x: screen.midX - size.width / 2, y: screen.maxY - size.height,
                       width: size.width, height: size.height)
     }
@@ -523,13 +611,13 @@ final class IslandController {
     /// then shrinks to the island once it settles, so no invisible window area covers other windows.
     private func fitExpanded(to size: CGSize) {
         fitWork?.cancel()
-        guard model.state == .expanded, size.height > 0 else { return }
+        guard shown == .expanded, size.height > 0 else { return }
         let full = frame(for: .expanded)
         if size.height + 30 > panel.frame.height { panel.setFrame(full, display: true); return } // content grew
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.model.state == .expanded else { return }
+            guard let self, self.shown == .expanded else { return }
             var f = full
-            f.size.height = min(full.height, self.model.islandSize.height + 30) // room for the shadow
+            f.size.height = min(full.height, self.islandSize.height + 30) // room for the shadow
             f.origin.y = full.maxY - f.height
             if abs(f.height - self.panel.frame.height) > 1 { self.panel.setFrame(f, display: true) }
         }
@@ -546,11 +634,81 @@ final class IslandController {
             panel.setFrame(target, display: true)
         } else {
             let work = DispatchWorkItem { [weak self] in
-                guard let self, self.model.state == s else { return }
+                guard let self, self.shown == s else { return }
                 self.panel.setFrame(target, display: true)
             }
             shrinkWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
         }
+    }
+}
+
+
+// MARK: - Islands on more than one screen
+
+/// One island per screen, one that follows the pointer, or one on a chosen screen (Settings › Screens).
+/// They all show the same status from IslandModel.
+@MainActor
+final class IslandManager {
+    private var islands: [IslandController] = []
+    private var bag = Set<AnyCancellable>()
+    private var followTimer: Timer?
+    private var followScreen = NotchGeometry.defaultScreen
+    private var screenIDs: [CGDirectDisplayID] = []
+
+    init() {
+        let settings = AppSettings.shared
+        settings.$islandScreens.map { _ in () }.merge(with: settings.$islandScreenName.map { _ in () }).dropFirst(2)
+            .sink { [weak self] in DispatchQueue.main.async { self?.rebuild() } }.store(in: &bag)
+        // Displays plugged in or out: an island for each new one (all) or back on the chosen screen.
+        NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)
+            .debounce(for: .milliseconds(500), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self, NSScreen.screens.map(\.displayID) != self.screenIDs else { return }
+                self.rebuild()
+            }.store(in: &bag)
+        rebuild()
+    }
+
+    static var chosenScreen: NSScreen {
+        if let name = AppSettings.shared.islandScreenName, let s = NSScreen.screens.first(where: { $0.localizedName == name }) { return s }
+        return NotchGeometry.defaultScreen
+    }
+
+    private func rebuild() {
+        islands.forEach { $0.close() }
+        followTimer?.invalidate()
+        followTimer = nil
+        screenIDs = NSScreen.screens.map(\.displayID)
+        let model = IslandModel.shared
+        switch AppSettings.shared.islandScreens {
+        case .all:
+            model.activeScreen = NotchGeometry.defaultScreen.displayID
+            islands = NSScreen.screens.map { screen in
+                let id = screen.displayID
+                return IslandController { NSScreen.screens.first { $0.displayID == id } ?? NotchGeometry.defaultScreen }
+            }
+        case .chosen:
+            model.activeScreen = Self.chosenScreen.displayID
+            islands = [IslandController { Self.chosenScreen }]
+        case .followMouse:
+            followScreen = NSScreen.under(NSEvent.mouseLocation) ?? NotchGeometry.defaultScreen
+            model.activeScreen = followScreen.displayID
+            islands = [IslandController { [weak self] in self?.followScreen ?? NotchGeometry.defaultScreen }]
+            // Checking where the pointer is costs next to nothing; the island moves only while it's closed.
+            followTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.follow() }
+            }
+        }
+        model.notch = NotchGeometry.of(NSScreen.screens.first { $0.displayID == model.activeScreen } ?? NotchGeometry.defaultScreen)
+    }
+
+    private func follow() {
+        let model = IslandModel.shared
+        guard model.state != .expanded, !model.dragNear,
+              let screen = NSScreen.under(NSEvent.mouseLocation), screen.displayID != followScreen.displayID else { return }
+        followScreen = screen
+        model.activeScreen = screen.displayID
+        islands.first?.relocate()
     }
 }
